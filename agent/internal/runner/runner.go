@@ -29,32 +29,166 @@ type Options struct {
 	RunID       string
 	MaxArrivals int
 	Logf        func(format string, args ...any)
+
+	// Sharding. Shard is 1-based; ShardCount 0 means the whole run.
+	Shard      int
+	ShardCount int
+	// StartAt is the shared epoch the schedule is anchored to. Agents on
+	// different processes or hosts use the same value so their arrivals line
+	// up. Zero means now + traffic.start_delay.
+	StartAt time.Time
+	Agent   string // name recorded in shard reports
 }
+
+func (o *Options) sharded() bool { return o.ShardCount > 0 }
 
 type engine struct {
-	sc     *scenario.Scenario
-	opt    Options
-	client *http.Client
-	base   string
-	start  time.Time // monotonic anchor for the schedule
-	sem    chan struct{}
-	wg     sync.WaitGroup
-	col    *collector
+	*control
+	opt   Options
+	start time.Time // monotonic anchor for the schedule
+	sem   chan struct{}
+	wg    sync.WaitGroup
+	col   *collector
 }
 
-// Run drives the scenario to completion (or until ctx is cancelled).
-func Run(ctx context.Context, sc *scenario.Scenario, opt Options) (*report.Report, error) {
+// control makes the non-load requests: hooks, counter snapshots, invariants.
+type control struct {
+	sc     *scenario.Scenario
+	client *http.Client
+	base   string
+}
+
+func newControl(sc *scenario.Scenario, conns int) *control {
+	return &control{
+		sc:   sc,
+		base: strings.TrimRight(sc.Target.BaseURL, "/"),
+		client: &http.Client{
+			Transport: &http.Transport{
+				MaxIdleConns:        conns,
+				MaxIdleConnsPerHost: conns,
+				MaxConnsPerHost:     0,
+				IdleConnTimeout:     30 * time.Second,
+			},
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		},
+	}
+}
+
+func checkSafety(sc *scenario.Scenario, opt Options) error {
+	if err := sc.CheckTarget(); err != nil {
+		return err
+	}
+	if opt.MaxArrivals > 0 && sc.Traffic.Arrivals > opt.MaxArrivals {
+		return fmt.Errorf("traffic.arrivals %d exceeds the safety cap of %d (raise it with --max-arrivals)",
+			sc.Traffic.Arrivals, opt.MaxArrivals)
+	}
+	return nil
+}
+
+func withDefaults(opt Options) Options {
 	if opt.Logf == nil {
 		opt.Logf = func(string, ...any) {}
 	}
-	if err := sc.CheckTarget(); err != nil {
+	return opt
+}
+
+// Run drives the whole scenario as a single agent: before hooks, traffic,
+// invariants, thresholds.
+func Run(ctx context.Context, sc *scenario.Scenario, opt Options) (*report.Report, error) {
+	opt = withDefaults(opt)
+	opt.Shard, opt.ShardCount = 0, 0
+	if err := checkSafety(sc, opt); err != nil {
 		return nil, err
 	}
-	if opt.MaxArrivals > 0 && sc.Traffic.Arrivals > opt.MaxArrivals {
-		return nil, fmt.Errorf("traffic.arrivals %d exceeds the safety cap of %d (raise it with --max-arrivals)",
-			sc.Traffic.Arrivals, opt.MaxArrivals)
+	startedAt := time.Now()
+	before, err := Prepare(ctx, sc)
+	if err != nil {
+		return nil, err
+	}
+	rep, err := traffic(ctx, sc, opt)
+	if err != nil {
+		return nil, err
+	}
+	rep.StartedAt = startedAt
+	Check(sc, rep, before, opt.Logf)
+	Evaluate(sc, rep)
+	return rep, nil
+}
+
+// RunShard sends only this agent's share of the traffic and returns a shard
+// report for Merge. It runs no hooks, snapshots or invariants: those act on
+// the whole target and belong to whoever coordinates the run.
+func RunShard(ctx context.Context, sc *scenario.Scenario, opt Options) (*report.Report, error) {
+	opt = withDefaults(opt)
+	if !opt.sharded() || opt.Shard < 1 || opt.Shard > opt.ShardCount {
+		return nil, fmt.Errorf("shard %d/%d is out of range", opt.Shard, opt.ShardCount)
+	}
+	if err := checkSafety(sc, opt); err != nil {
+		return nil, err
+	}
+	return traffic(ctx, sc, opt)
+}
+
+// Prepare runs the before hooks and takes the "before" counter snapshot.
+func Prepare(ctx context.Context, sc *scenario.Scenario) (map[string]float64, error) {
+	c := newControl(sc, 4)
+	defer c.client.CloseIdleConnections()
+	for _, h := range sc.Hooks.Before {
+		if err := c.hook(ctx, h); err != nil {
+			return nil, fmt.Errorf("before hook %s %s: %w", h.Method, h.Path, err)
+		}
+	}
+	if sc.Observe.URL == "" {
+		return nil, nil
+	}
+	before, err := c.snapshot(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("observe snapshot (before): %w", err)
+	}
+	return before, nil
+}
+
+// Check takes the "after" snapshot, polls the invariants and runs the after
+// hooks. It uses its own context so an interrupted run still gets checked.
+func Check(sc *scenario.Scenario, rep *report.Report, before map[string]float64, logf func(string, ...any)) {
+	if logf == nil {
+		logf = func(string, ...any) {}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	c := newControl(sc, 4)
+	defer c.client.CloseIdleConnections()
+
+	if sc.Observe.URL != "" && before != nil {
+		after, err := c.snapshot(ctx)
+		if err != nil {
+			logf("observe snapshot (after) failed: %v", err)
+		} else {
+			rep.TargetStats = targetStats(before, after, rep.Totals.Logical)
+		}
 	}
 
+	invs := make([]report.InvariantCheck, 0, len(sc.Invariants))
+	for _, inv := range sc.Invariants {
+		invs = append(invs, c.checkInvariant(ctx, inv))
+	}
+	rep.Invariants = invs
+
+	for _, h := range sc.Hooks.After {
+		if err := c.hook(ctx, h); err != nil {
+			logf("after hook %s %s failed: %v", h.Method, h.Path, err)
+		}
+	}
+}
+
+// Evaluate applies the scenario's thresholds and computes the verdict.
+func Evaluate(sc *scenario.Scenario, rep *report.Report) {
+	rep.Thresholds = evalThresholds(sc.Thresholds, rep)
+	rep.Finalize()
+}
+
+// traffic fires this agent's arrivals and waits for their workflows.
+func traffic(ctx context.Context, sc *scenario.Scenario, opt Options) (*report.Report, error) {
 	offsets, err := schedule.Plan(schedule.Profile{
 		Kind:     sc.Traffic.Profile,
 		Arrivals: sc.Traffic.Arrivals,
@@ -65,47 +199,55 @@ func Run(ctx context.Context, sc *scenario.Scenario, opt Options) (*report.Repor
 		return nil, err
 	}
 
+	// The shard is always cut from the full plan, so every agent agrees on
+	// which arrival is which.
+	var mine []int
+	inflight := sc.Traffic.MaxInflight
+	if opt.sharded() {
+		if mine, err = schedule.Shard(len(offsets), opt.Shard, opt.ShardCount); err != nil {
+			return nil, err
+		}
+		// max_inflight is a budget for the whole run, split across agents.
+		inflight = (inflight + opt.ShardCount - 1) / opt.ShardCount
+	} else {
+		mine = make([]int, len(offsets))
+		for i := range mine {
+			mine[i] = i
+		}
+	}
+
 	e := &engine{
-		sc:   sc,
-		opt:  opt,
-		base: strings.TrimRight(sc.Target.BaseURL, "/"),
-		sem:  make(chan struct{}, sc.Traffic.MaxInflight),
-		col:  newCollector(),
-		client: &http.Client{
-			Transport: &http.Transport{
-				MaxIdleConns:        sc.Traffic.MaxInflight,
-				MaxIdleConnsPerHost: sc.Traffic.MaxInflight,
-				MaxConnsPerHost:     0,
-				IdleConnTimeout:     30 * time.Second,
-			},
-			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
-		},
+		control: newControl(sc, inflight),
+		opt:     opt,
+		sem:     make(chan struct{}, inflight),
+		col:     newCollector(),
 	}
 	defer e.client.CloseIdleConnections()
 
 	startedAt := time.Now()
-
-	for _, h := range sc.Hooks.Before {
-		if err := e.hook(ctx, h); err != nil {
-			return nil, fmt.Errorf("before hook %s %s: %w", h.Method, h.Path, err)
-		}
+	startAt := opt.StartAt
+	if startAt.IsZero() {
+		startAt = startedAt.Add(sc.Traffic.StartDelay)
 	}
-
-	var before map[string]float64
-	if sc.Observe.URL != "" {
-		before, err = e.snapshot(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("observe snapshot (before): %w", err)
-		}
-	}
-
-	e.start = time.Now().Add(sc.Traffic.StartDelay)
+	// Re-derive the anchor from time.Now so it carries a monotonic reading;
+	// a StartAt parsed from a flag only has wall-clock time.
+	lead := time.Until(startAt)
+	e.start = time.Now().Add(lead)
 	e.col.setStart(e.start)
-	opt.Logf("firing %d arrivals (%s) in %s, planned span %s",
-		len(offsets), sc.Traffic.Profile, sc.Traffic.StartDelay.Round(time.Millisecond), offsets[len(offsets)-1].Round(time.Millisecond))
 
-	for i, off := range offsets {
-		i, off := i, off
+	who := ""
+	if opt.sharded() {
+		who = fmt.Sprintf("shard %d/%d: ", opt.Shard, opt.ShardCount)
+	}
+	if lead < 0 {
+		opt.Logf("%sstart time passed %s ago; arrivals will fire late and the lateness shows up as arrival skew",
+			who, (-lead).Round(time.Millisecond))
+	}
+	opt.Logf("%sfiring %d of %d arrivals (%s) in %s, planned span %s",
+		who, len(mine), len(offsets), sc.Traffic.Profile, lead.Round(time.Millisecond), offsets[len(offsets)-1].Round(time.Millisecond))
+
+	for _, i := range mine {
+		i, off := i, offsets[i]
 		e.wg.Add(1)
 		time.AfterFunc(time.Until(e.start.Add(off)), func() {
 			defer e.wg.Done()
@@ -123,36 +265,19 @@ func Run(ctx context.Context, sc *scenario.Scenario, opt Options) (*report.Repor
 	}
 	endedAt := time.Now()
 
-	// Post-run checks use a fresh context so Ctrl-C still produces a report.
-	cctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-
-	var after map[string]float64
-	if sc.Observe.URL != "" {
-		after, err = e.snapshot(cctx)
-		if err != nil {
-			opt.Logf("observe snapshot (after) failed: %v", err)
-		}
-	}
-
-	invs := make([]report.InvariantCheck, 0, len(sc.Invariants))
-	for _, inv := range sc.Invariants {
-		invs = append(invs, e.checkInvariant(cctx, inv))
-	}
-
-	for _, h := range sc.Hooks.After {
-		if err := e.hook(cctx, h); err != nil {
-			opt.Logf("after hook %s %s failed: %v", h.Method, h.Path, err)
-		}
-	}
-
 	rep := e.col.build(sc, opt, startedAt, endedAt, offsets)
-	if before != nil && after != nil {
-		rep.TargetStats = targetStats(before, after, rep.Totals.Logical)
+	if opt.sharded() {
+		rep.Shard = &report.ShardInfo{
+			Index:        opt.Shard,
+			Count:        opt.ShardCount,
+			Arrivals:     len(mine),
+			ScenarioHash: sc.Hash(),
+			StartAt:      startAt.Round(0).UTC(),
+			Agent:        opt.Agent,
+		}
+	} else {
+		rep.Raw = nil
 	}
-	rep.Invariants = invs
-	rep.Thresholds = evalThresholds(sc.Thresholds, rep)
-	rep.Finalize()
 	return rep, nil
 }
 
@@ -396,7 +521,7 @@ func backoff(r scenario.Retry, attempt int, rng *rand.Rand, retryAfter time.Dura
 
 // ---------------------------------------------------- control + checking ---
 
-func (e *engine) call(ctx context.Context, method, path string, headers map[string]string, body any) (int, []byte, error) {
+func (c *control) call(ctx context.Context, method, path string, headers map[string]string, body any) (int, []byte, error) {
 	var rd io.Reader
 	if body != nil {
 		b, err := json.Marshal(body)
@@ -407,7 +532,7 @@ func (e *engine) call(ctx context.Context, method, path string, headers map[stri
 	}
 	cctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-	req, err := http.NewRequestWithContext(cctx, method, e.base+path, rd)
+	req, err := http.NewRequestWithContext(cctx, method, c.base+path, rd)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -417,7 +542,7 @@ func (e *engine) call(ctx context.Context, method, path string, headers map[stri
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
-	resp, err := e.client.Do(req)
+	resp, err := c.client.Do(req)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -426,8 +551,8 @@ func (e *engine) call(ctx context.Context, method, path string, headers map[stri
 	return resp.StatusCode, b, err
 }
 
-func (e *engine) hook(ctx context.Context, c scenario.Call) error {
-	code, _, err := e.call(ctx, c.Method, c.Path, c.Headers, c.Body)
+func (c *control) hook(ctx context.Context, h scenario.Call) error {
+	code, _, err := c.call(ctx, h.Method, h.Path, h.Headers, h.Body)
 	if err != nil {
 		return err
 	}
@@ -437,8 +562,8 @@ func (e *engine) hook(ctx context.Context, c scenario.Call) error {
 	return nil
 }
 
-func (e *engine) fetchValue(ctx context.Context, path, jp string) (float64, map[string]any, error) {
-	code, body, err := e.call(ctx, "GET", path, nil, nil)
+func (c *control) fetchValue(ctx context.Context, path, jp string) (float64, map[string]any, error) {
+	code, body, err := c.call(ctx, "GET", path, nil, nil)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -461,14 +586,14 @@ func (e *engine) fetchValue(ctx context.Context, path, jp string) (float64, map[
 	return f, m, nil
 }
 
-func (e *engine) snapshot(ctx context.Context) (map[string]float64, error) {
+func (c *control) snapshot(ctx context.Context) (map[string]float64, error) {
 	out := map[string]float64{}
-	for _, c := range e.sc.Observe.Counters {
-		v, _, err := e.fetchValue(ctx, e.sc.Observe.URL, c)
+	for _, ctr := range c.sc.Observe.Counters {
+		v, _, err := c.fetchValue(ctx, c.sc.Observe.URL, ctr)
 		if err != nil {
 			return nil, err
 		}
-		out[strings.TrimPrefix(strings.TrimPrefix(c, "$"), ".")] = v
+		out[strings.TrimPrefix(strings.TrimPrefix(ctr, "$"), ".")] = v
 	}
 	return out, nil
 }
@@ -485,12 +610,12 @@ func targetStats(before, after map[string]float64, logical int) *report.TargetSt
 	return ts
 }
 
-func (e *engine) checkInvariant(ctx context.Context, inv scenario.Invariant) report.InvariantCheck {
+func (c *control) checkInvariant(ctx context.Context, inv scenario.Invariant) report.InvariantCheck {
 	res := report.InvariantCheck{Name: inv.Name, Op: inv.Op, Expected: inv.Value}
 	t0 := time.Now()
 	deadline := t0.Add(inv.Eventually)
 	for {
-		v, _, err := e.fetchValue(ctx, inv.Path, inv.JSON)
+		v, _, err := c.fetchValue(ctx, inv.Path, inv.JSON)
 		res.Observed, res.Error = v, ""
 		if err != nil {
 			res.Error = err.Error()
@@ -639,14 +764,6 @@ func (c *collector) finishWorkflow(ok bool, outcome string, lat time.Duration) {
 	}
 }
 
-func lat(h *hist.Histogram) report.Latency {
-	f := func(d time.Duration) float64 { return float64(d.Microseconds()) / 1000 }
-	return report.Latency{
-		Count: h.Count(), MeanMs: f(h.Mean()),
-		P50Ms: f(h.Quantile(0.50)), P95Ms: f(h.Quantile(0.95)), P99Ms: f(h.Quantile(0.99)), MaxMs: f(h.Max()),
-	}
-}
-
 func (c *collector) build(sc *scenario.Scenario, opt Options, started, ended time.Time, offsets []time.Duration) *report.Report {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -672,31 +789,13 @@ func (c *collector) build(sc *scenario.Scenario, opt Options, started, ended tim
 			FinalOutcomes: c.outcomes, Aborted: c.aborted,
 		},
 		Attempts: report.Attempts{Total: c.attempts, ByKind: c.byKind, ByClass: c.byClass},
-		Latency: report.LatencySet{
-			WorkflowOK:  lat(c.e2eOK),
-			WorkflowAll: lat(c.e2eAll),
-			Steps:       map[string]report.Latency{},
+		Raw: &report.Raw{
+			WorkflowOK:  c.e2eOK,
+			WorkflowAll: c.e2eAll,
+			ArrivalSkew: c.skew,
+			Steps:       c.steps,
+			LastDoneMs:  float64(c.lastDone.Microseconds()) / 1000,
 		},
-		ArrivalSkew: lat(c.skew),
-	}
-	// Amplification is attempts per intended request: every step a user
-	// reaches counts once as a "first" attempt, and retries and double
-	// submits are the extra load on top of that.
-	if first := c.byKind["first"]; first > 0 {
-		r.Attempts.RetryAmplification = float64(c.attempts) / float64(first)
-	}
-	for name, h := range c.steps {
-		r.Latency.Steps[name] = lat(h)
-	}
-
-	span := c.lastDone.Seconds()
-	if span <= 0 {
-		span = ended.Sub(started).Seconds()
-	}
-	r.Throughput = report.Throughput{
-		DurationSec:    span,
-		AttemptsPerSec: float64(c.attempts) / span,
-		GoodputPerSec:  float64(c.succeeded) / span,
 	}
 
 	last := -1
@@ -714,5 +813,6 @@ func (c *collector) build(sc *scenario.Scenario, opt Options, started, ended tim
 			Second: s, Attempts: b.attempts, OK: b.ok, Failed: b.failed, Retries: b.retries,
 		})
 	}
+	r.Derive()
 	return r
 }

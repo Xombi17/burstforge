@@ -27,7 +27,7 @@ Typical numbers from the fragile run (they move a little between runs because th
 | | fragile | hardened |
 |---|---:|---:|
 | HTTP error rate | 0% | 0% |
-| Duplicate registrations | 5–8 | 0 |
+| Duplicate registrations | 5–9 | 0 |
 | Oversold seats | 0–3 | 0 |
 | Confirmation jobs lost | ~50 | 0 |
 | Latency p99 | ~9–10 s | ~5.5 s |
@@ -73,6 +73,29 @@ bin/burstforge compare results/<before>/report.json results/<after>/report.json
 
 `run` exits 0 on pass, 1 on a failed verdict and 2 on bad config, so it works as a CI gate. Each run writes `report.json` and a shareable `report.md`.
 
+### Several agents
+
+One agent process tops out somewhere (CPU, sockets, one network path). To split a run:
+
+```bash
+bin/burstforge run checkout.yaml --agents 3
+```
+
+This runs the `before` hooks once, starts three agent processes that all schedule from one shared start time, merges their shard reports, and then checks invariants once. The report gets an agents table with per-shard arrivals, attempts and arrival skew.
+
+Arrivals are dealt round-robin from the full plan (arrival `i` goes to shard `i mod N`), so each agent fires the same burst shape at a third of the density and keeps the global arrival number. With the same `--seed`, a 3-agent run sends the same logical requests, retries and double submits as a 1-agent run. `max_inflight` is a budget for the whole run and is split between agents.
+
+For agents on separate machines, run the two halves yourself. Every agent needs the same seed, run ID, start time and scenario flags:
+
+```bash
+bin/burstforge agent checkout.yaml --shard 1/3 --seed 42 --run-id launch-1 --start-at 2026-11-10T10:00:00Z
+bin/burstforge merge checkout.yaml results/launch-1/shard-*.json
+```
+
+`agent` only sends traffic. It runs no hooks and checks no invariants, because those act on the whole target. `merge` refuses shards from different runs or scenarios, counts a shard delivered twice once, and errors if the same shard comes back with different results (two agents ran it). A missing shard is an error. With `--allow-partial` it merges anyway and fails the verdict. Run `merge` right after the agents finish, because it checks invariants against the target as it is now (`--no-check` skips that and marks them unchecked). It has no "before" snapshot, so it doesn't diff target counters. `run --agents` does.
+
+Limits for now: arrival skew is measured on each agent's own clock, so clock offset between machines isn't measured yet (that needs the Week 4 clock-offset handshake). There are no leases either. If an agent dies, its shard is reported missing, not re-run.
+
 Business invariants need a read-only endpoint on your staging app that exposes the counts you care about (see `GET /_bf/invariants` in [target/server.js](target/server.js) for a 20-line example). Without one, BurstForge still reports latency, failures and amplification.
 
 ## What it measures
@@ -111,6 +134,6 @@ make race     # same, under the race detector
 
 ## Status
 
-This is the Week 1–3 slice of the plan, running as a single agent. See [docs/ROADMAP.md](docs/ROADMAP.md) for what's done and what's next. Not built yet: multi-agent sharding and leases, the fault-injection proxy, the control plane and dashboard, Playwright import, the k6 benchmark.
+This is the Week 1–3 slice of the plan: a single agent, or several agents coordinated from one command or by hand. See [docs/ROADMAP.md](docs/ROADMAP.md) for what's done and what's next. Not built yet: Postgres-backed leases and shard recovery, the fault-injection proxy, the control plane and dashboard, Playwright import, the k6 benchmark.
 
 The Docker files (`docker-compose.yml`, `agent/Dockerfile`) are written but have not been built or run.

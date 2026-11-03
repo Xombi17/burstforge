@@ -29,8 +29,9 @@ These are about people, not code. The code below is ahead of the user work.
 - [x] Arrival-skew measurement
 - [x] Retry amplification and double-submit modelling
 - [x] Business invariants with `eventually` polling
-- [ ] Deterministic sharding across multiple agents
-- [ ] Merge reports from several agents (histograms already merge; the reducer doesn't exist yet)
+- [x] Deterministic sharding across multiple agents (round-robin over the seeded plan; `run --agents N`, or `agent` + `merge` across machines)
+- [x] Merge reports from several agents: shard reports carry histograms; the reducer rejects mismatched runs and conflicting duplicates and flags missing shards
+- [x] Milestone check: 3 local agents, 1,000 arrivals, report with per-agent skew and merged latency. Same seed on 1 vs 3 agents gave identical attempt counts (1,123) and outcomes on the hardened burst.
 
 ## Week 4: durable run state
 

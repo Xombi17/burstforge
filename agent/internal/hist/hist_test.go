@@ -1,6 +1,7 @@
 package hist
 
 import (
+	"encoding/json"
 	"math/rand"
 	"sort"
 	"testing"
@@ -57,5 +58,27 @@ func TestEmptyAndClamp(t *testing.T) {
 	h.Record(5 * time.Millisecond)
 	if h.Quantile(0.99) > h.Max() {
 		t.Fatal("quantile must not exceed observed max")
+	}
+}
+
+func TestJSONRoundTripPreservesQuantiles(t *testing.T) {
+	var h Histogram
+	for i := 1; i <= 5000; i++ {
+		h.Record(time.Duration(i) * 137 * time.Microsecond)
+	}
+	b, err := json.Marshal(&h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back Histogram
+	if err := json.Unmarshal(b, &back); err != nil {
+		t.Fatal(err)
+	}
+	if back != h {
+		t.Fatal("histogram changed across a JSON round trip")
+	}
+	bad := []byte(`{"n":5,"sum_us":1,"min_us":1,"max_us":1,"buckets":[[3,4]]}`)
+	if err := json.Unmarshal(bad, &back); err == nil {
+		t.Fatal("expected a count mismatch error")
 	}
 }

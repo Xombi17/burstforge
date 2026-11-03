@@ -3,6 +3,9 @@ package scenario
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -383,4 +386,17 @@ func referencedVars(path string, headers map[string]string, body any) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// Hash fingerprints the scenario after defaults and command-line overrides.
+// Shards of one run must carry the same hash before their reports merge.
+func (s *Scenario) Hash() string {
+	b, err := json.Marshal(s)
+	if err != nil {
+		// Bodies come from YAML, so they are always JSON-encodable maps,
+		// slices and scalars. Fall back to %#v rather than panic.
+		b = []byte(fmt.Sprintf("%#v", s))
+	}
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:8])
 }
