@@ -39,6 +39,9 @@ type Report struct {
 	Shard  *ShardInfo     `json:"shard,omitempty"`  // set on a shard report
 	Shards []ShardSummary `json:"shards,omitempty"` // set on a merged report
 	Raw    *Raw           `json:"raw,omitempty"`    // shard reports only
+
+	Recovery    *Recovery    `json:"recovery,omitempty"`     // set on lease-based runs
+	ShardDetail *ShardDetail `json:"shard_detail,omitempty"` // reducer-internal
 }
 
 type Traffic struct {
@@ -54,6 +57,9 @@ type Totals struct {
 	Failed        int            `json:"failed"`
 	FinalOutcomes map[string]int `json:"final_outcomes"`
 	Aborted       bool           `json:"aborted"`
+	// Arrivals an agent did not send because they were already too late when
+	// it took over a shard. Sending them would add a burst the plan never had.
+	SkippedOverdue int `json:"skipped_overdue,omitempty"`
 }
 
 type Attempts struct {
@@ -132,6 +138,10 @@ func (r *Report) Finalize() {
 		if s.Missing {
 			fails = append(fails, fmt.Sprintf("shard %d/%d produced no report; the numbers above cover only the other shards", s.Index, s.Count))
 		}
+	}
+	if rc := r.Recovery; rc != nil && rc.Unaccounted+rc.SkippedOverdue+rc.NotSent > 0 {
+		fails = append(fails, fmt.Sprintf("%d of %d planned arrivals did not run as planned (%d unaccounted after an agent failure, %d skipped as overdue, %d never sent); the load did not match the plan",
+			rc.Unaccounted+rc.SkippedOverdue+rc.NotSent, r.Traffic.Arrivals, rc.Unaccounted, rc.SkippedOverdue, rc.NotSent))
 	}
 	for _, t := range r.Thresholds {
 		if !t.Pass {
@@ -249,8 +259,16 @@ func (r *Report) Text() string {
 				w("    shard %d/%d  MISSING", s.Index, s.Count)
 				continue
 			}
-			w("    shard %d/%d  %-24s %5d arrivals %6d attempts  skew p99 %s%s",
-				s.Index, s.Count, s.Agent, s.Arrivals, s.Attempts, ms(s.ArrivalSkewP99Ms), abortedTag(s.Aborted))
+			w("    shard %d/%d  %-24s %5d arrivals %6d attempts  skew p99 %s%s%s",
+				s.Index, s.Count, s.Agent, s.Arrivals, s.Attempts, ms(s.ArrivalSkewP99Ms), abortedTag(s.Aborted), leaseTag(s))
+		}
+	}
+	if rc := r.Recovery; rc != nil && (rc.Takeovers > 0 || len(rc.Events) > 0) {
+		w("")
+		w("  recovery      %d takeovers, %d arrivals unaccounted, %d skipped as overdue, %d never sent",
+			rc.Takeovers, rc.Unaccounted, rc.SkippedOverdue, rc.NotSent)
+		for _, e := range rc.Events {
+			w("    - %s", e)
 		}
 	}
 	if len(r.Notes) > 0 {
@@ -353,16 +371,25 @@ func (r *Report) Markdown() string {
 		w("")
 		w("Arrival skew is measured on each agent's own clock against the shared start time.")
 		w("")
-		w("| Shard | Agent | Arrivals | Workflows | Attempts | Skew p99 |")
-		w("|---|---|---:|---:|---:|---:|")
+		w("| Shard | Agent | Arrivals | Workflows | Attempts | Skew p99 | Leases | Unaccounted | Skipped | Never sent |")
+		w("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|")
 		for _, s := range r.Shards {
 			if s.Missing {
-				w("| %d/%d | missing | | | | |", s.Index, s.Count)
+				w("| %d/%d | missing | | | | | | | | |", s.Index, s.Count)
 				continue
 			}
-			w("| %d/%d | `%s`%s | %d | %d | %d | %s |", s.Index, s.Count, s.Agent, abortedTag(s.Aborted), s.Arrivals, s.Logical, s.Attempts, ms(s.ArrivalSkewP99Ms))
+			w("| %d/%d | `%s`%s | %d | %d | %d | %s | %d | %d | %d | %d |", s.Index, s.Count, s.Agent, abortedTag(s.Aborted),
+				s.Arrivals, s.Logical, s.Attempts, ms(s.ArrivalSkewP99Ms), max(s.Epochs, 1), s.Unaccounted, s.SkippedOverdue, s.NotSent)
 		}
 		w("")
+		if rc := r.Recovery; rc != nil && len(rc.Events) > 0 {
+			w("Lease history:")
+			w("")
+			for _, e := range rc.Events {
+				w("- %s", e)
+			}
+			w("")
+		}
 	}
 	if len(r.Latency.Steps) > 0 {
 		w("## Per-step attempt latency")
@@ -395,6 +422,26 @@ func (r *Report) Markdown() string {
 		w("")
 	}
 	return b.String()
+}
+
+func leaseTag(s ShardSummary) string {
+	var parts []string
+	if s.Epochs > 1 {
+		parts = append(parts, fmt.Sprintf("%d leases", s.Epochs))
+	}
+	if s.Unaccounted > 0 {
+		parts = append(parts, fmt.Sprintf("%d unaccounted", s.Unaccounted))
+	}
+	if s.NotSent > 0 {
+		parts = append(parts, fmt.Sprintf("%d never sent", s.NotSent))
+	}
+	if s.SkippedOverdue > 0 {
+		parts = append(parts, fmt.Sprintf("%d skipped", s.SkippedOverdue))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "  (" + strings.Join(parts, ", ") + ")"
 }
 
 func abortedTag(a bool) string {

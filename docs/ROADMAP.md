@@ -35,10 +35,13 @@ These are about people, not code. The code below is ahead of the user work.
 
 ## Week 4: durable run state
 
-- [ ] Postgres schema: runs, run_shards, agent_leases
-- [ ] `FOR UPDATE SKIP LOCKED` shard claiming, heartbeats, fencing epochs
-- [ ] Kill an agent mid-run and recover its shard
-- [ ] Clock-offset handshake
+- [x] Postgres schema: runs, run_shards, agent_leases, telemetry_chunks (`agent/internal/store/schema.sql`)
+- [x] `FOR UPDATE SKIP LOCKED` shard claiming, heartbeats, fencing epochs
+- [x] Arrival reservations, so a takeover never resends an arrival; overdue arrivals are skipped and counted
+- [x] Idempotent telemetry chunks with sequence numbers (pulled forward from Week 6)
+- [x] Kill an agent mid-run and recover its shard (`make recovery`; tested with SIGKILL, Ctrl-C, coordinator SIGKILL, and no agents at all)
+- [x] Clock-offset handshake against the database clock
+- [ ] Agents trust the target and allow-list stored in the database. Fine for a single team; needs per-tenant checks before anyone else can write runs (Week 6)
 
 ## Week 5: fault injection
 
@@ -50,7 +53,7 @@ These are about people, not code. The code below is ahead of the user work.
 
 - [ ] Organizations, API keys, quotas
 - [ ] OpenTelemetry export, Prometheus metrics
-- [ ] Idempotent telemetry chunks with sequence numbers
+- [x] Idempotent telemetry chunks with sequence numbers (done in Week 4)
 
 ## Week 7: dashboard
 

@@ -37,11 +37,19 @@ Usage:
                                    [--allow-partial] [scenario flags]
   burstforge compare <before/report.json> <after/report.json>
 
+With Postgres (leases, heartbeats, takeover of a dead agent's shard):
+  burstforge run <scenario.yaml> --db URL --shards N [--agents M] [--lease-ttl D]
+                                 [--lead D] [--drain-timeout D] [scenario flags]
+  burstforge agent --db URL [--run ID] [--name NAME] [--max-arrivals N]
+  burstforge finalize --db URL <run-id> [--out DIR]
+  burstforge status --db URL [run-id]
+
 Scenario flags: [--arrivals N] [--max-arrivals N] [--target URL] [--allow-host HOST]
 
 run --agents N splits the run across N local agent processes and merges their
 reports. agent and merge are the same two halves, for running agents on
-separate machines.
+separate machines. With --db, run stores the run in Postgres and agents claim
+shards from it; --db defaults to $BURSTFORGE_DB.
 
 Exit codes: 0 pass, 1 verdict failed, 2 bad usage or config.
 `
@@ -63,6 +71,10 @@ func main() {
 		code = cmdMerge(os.Args[2:])
 	case "compare":
 		code = cmdCompare(os.Args[2:])
+	case "finalize":
+		code = cmdFinalize(os.Args[2:])
+	case "status":
+		code = cmdStatus(os.Args[2:])
 	case "version", "--version":
 		fmt.Println("burstforge", runner.Version)
 	case "help", "-h", "--help":
@@ -170,7 +182,8 @@ func cmdRun(args []string) int {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	out := fs.String("out", "burstforge-results", "directory for report files")
 	seed := fs.Int64("seed", 0, "random seed (default: time-based; printed so you can replay it)")
-	agents := fs.Int("agents", 1, "split the run across this many local agent processes")
+	agents := fs.Int("agents", 0, "split the run across this many local agent processes (with --db: local workers to start)")
+	df := addDBFlags(fs)
 	sf := addScenarioFlags(fs)
 	pos, err := parse(fs, args)
 	if err != nil || len(pos) != 1 {
@@ -183,8 +196,15 @@ func cmdRun(args []string) int {
 		fmt.Fprintln(os.Stderr, err)
 		return 2
 	}
-	if *agents < 1 || *agents > sc.Traffic.Arrivals {
+	if df.url == "" && *agents == 0 {
+		*agents = 1
+	}
+	if *agents < 0 || *agents > sc.Traffic.Arrivals {
 		fmt.Fprintf(os.Stderr, "--agents must be between 1 and traffic.arrivals (%d)\n", sc.Traffic.Arrivals)
+		return 2
+	}
+	if df.url != "" && (df.shards < 1 || df.shards > sc.Traffic.Arrivals) {
+		fmt.Fprintf(os.Stderr, "--shards must be between 1 and traffic.arrivals (%d)\n", sc.Traffic.Arrivals)
 		return 2
 	}
 	if *seed == 0 {
@@ -196,13 +216,17 @@ func cmdRun(args []string) int {
 	defer stop()
 
 	fmt.Printf("run %s  scenario %q  seed %d", runID, sc.Name, *seed)
-	if *agents > 1 {
+	if df.url != "" {
+		fmt.Printf("  shards %d  local agents %d  (leases in Postgres)", df.shards, *agents)
+	} else if *agents > 1 {
 		fmt.Printf("  agents %d", *agents)
 	}
 	fmt.Println()
 
 	var rep *report.Report
-	if *agents == 1 {
+	if df.url != "" {
+		rep, err = coordinateDB(ctx, pos[0], sc, sf, df, *agents, *seed, runID)
+	} else if *agents == 1 {
 		rep, err = runner.Run(ctx, sc, runner.Options{
 			Seed: *seed, RunID: runID, MaxArrivals: sf.maxArrivals, Logf: logf,
 		})
@@ -221,13 +245,8 @@ func cmdRun(args []string) int {
 // checks invariants once against the target.
 func coordinate(ctx context.Context, path string, sc *scenario.Scenario, sf *scenarioFlags,
 	n int, seed int64, runID, out string) (*report.Report, error) {
-	// Same safety checks a single agent does, before any hook touches the target.
-	if err := sc.CheckTarget(); err != nil {
+	if err := preflight(sc, sf); err != nil {
 		return nil, err
-	}
-	if sf.maxArrivals > 0 && sc.Traffic.Arrivals > sf.maxArrivals {
-		return nil, fmt.Errorf("traffic.arrivals %d exceeds the safety cap of %d (raise it with --max-arrivals)",
-			sc.Traffic.Arrivals, sf.maxArrivals)
 	}
 	exe, err := os.Executable()
 	if err != nil {
@@ -318,6 +337,19 @@ func coordinate(ctx context.Context, path string, sc *scenario.Scenario, sf *sce
 	return rep, nil
 }
 
+// preflight runs the safety checks a single agent does, before any hook
+// touches the target.
+func preflight(sc *scenario.Scenario, sf *scenarioFlags) error {
+	if err := sc.CheckTarget(); err != nil {
+		return err
+	}
+	if sf.maxArrivals > 0 && sc.Traffic.Arrivals > sf.maxArrivals {
+		return fmt.Errorf("traffic.arrivals %d exceeds the safety cap of %d (raise it with --max-arrivals)",
+			sc.Traffic.Arrivals, sf.maxArrivals)
+	}
+	return nil
+}
+
 func prefixLines(r io.Reader, prefix string, mu *sync.Mutex) {
 	sc := bufio.NewScanner(r)
 	for sc.Scan() {
@@ -332,6 +364,11 @@ func shardPath(dir string, k, n int) string {
 }
 
 func cmdAgent(args []string) int {
+	for _, a := range args {
+		if a == "--db" || a == "-db" || strings.HasPrefix(a, "--db=") || strings.HasPrefix(a, "-db=") {
+			return cmdAgentDB(args)
+		}
+	}
 	fs := flag.NewFlagSet("agent", flag.ContinueOnError)
 	out := fs.String("out", "burstforge-results", "directory for report files")
 	shardArg := fs.String("shard", "", "this agent's shard, as K/N (1-based)")

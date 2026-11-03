@@ -31,6 +31,31 @@ type ShardSummary struct {
 	ArrivalSkewP99Ms float64 `json:"arrival_skew_p99_ms"`
 	Aborted          bool    `json:"aborted,omitempty"`
 	Missing          bool    `json:"missing,omitempty"`
+
+	// Set when shards ran under leases (run --db).
+	Epochs         int     `json:"epochs,omitempty"`      // leases taken on this shard
+	Unaccounted    int     `json:"unaccounted,omitempty"` // reserved, no recorded outcome: may or may not have been sent
+	NotSent        int     `json:"not_sent,omitempty"`    // never reserved, so never sent
+	SkippedOverdue int     `json:"skipped_overdue,omitempty"`
+	ClockOffsetMs  float64 `json:"clock_offset_ms,omitempty"` // last agent's offset to the database clock
+}
+
+// ShardDetail is what the lease-based reducer knows about a shard beyond its
+// telemetry. It rides on a synthesized shard report into Merge.
+type ShardDetail struct {
+	Epochs        int     `json:"epochs"`
+	Unaccounted   int     `json:"unaccounted"`
+	NotSent       int     `json:"not_sent"`
+	ClockOffsetMs float64 `json:"clock_offset_ms"`
+}
+
+// Recovery summarizes what lease expiry and takeover did to a run.
+type Recovery struct {
+	Takeovers      int      `json:"takeovers"`                // shards resumed by a new lease holder
+	Unaccounted    int      `json:"unaccounted_arrivals"`     // reserved by an agent that died before reporting them
+	NotSent        int      `json:"not_sent_arrivals"`        // no agent reached them before the run was finalized
+	SkippedOverdue int      `json:"skipped_overdue_arrivals"` // too late to send by the time a new agent took over
+	Events         []string `json:"events,omitempty"`
 }
 
 // Raw carries the mergeable state behind the summary numbers. Shard reports
@@ -151,7 +176,51 @@ func Merge(shards []*Report, allowPartial bool) (*Report, error) {
 		return nil, fmt.Errorf("missing shard(s) %v of %d", missing, count)
 	}
 
-	out := &Report{
+	out := emptyLike(ref)
+	out.Notes = notes
+	for i := 1; i <= count; i++ {
+		s := byIndex[i]
+		if s == nil {
+			out.Shards = append(out.Shards, ShardSummary{Index: i, Count: count, Missing: true})
+			continue
+		}
+		out.add(s)
+		sum := ShardSummary{
+			Index: i, Count: count, Agent: s.Shard.Agent,
+			Arrivals: s.Shard.Arrivals, Logical: s.Totals.Logical, Attempts: s.Attempts.Total,
+			ArrivalSkewP99Ms: s.ArrivalSkew.P99Ms, Aborted: s.Totals.Aborted,
+			SkippedOverdue: s.Totals.SkippedOverdue,
+		}
+		if s.ShardDetail != nil {
+			sum.Epochs = s.ShardDetail.Epochs
+			sum.Unaccounted = s.ShardDetail.Unaccounted
+			sum.NotSent = s.ShardDetail.NotSent
+			sum.ClockOffsetMs = s.ShardDetail.ClockOffsetMs
+		}
+		out.Shards = append(out.Shards, sum)
+	}
+	out.Derive()
+	out.Raw = nil // a merged report is a final report
+	sort.Slice(out.Shards, func(a, b int) bool { return out.Shards[a].Index < out.Shards[b].Index })
+	return out, nil
+}
+
+// Sum adds partial reports (the telemetry chunks of one shard) into a single
+// report with the identity of base. Raw is kept, so the result can go on to
+// Merge.
+func Sum(base *Report, parts []*Report) *Report {
+	out := emptyLike(base)
+	out.Shard = base.Shard
+	out.StartedAt, out.FinishedAt = base.StartedAt, base.FinishedAt
+	for _, p := range parts {
+		out.add(p)
+	}
+	out.Derive()
+	return out
+}
+
+func emptyLike(ref *Report) *Report {
+	return &Report{
 		Schema:      SchemaVersion,
 		Tool:        ref.Tool,
 		Scenario:    ref.Scenario,
@@ -163,69 +232,56 @@ func Merge(shards []*Report, allowPartial bool) (*Report, error) {
 		Totals:      Totals{FinalOutcomes: map[string]int{}},
 		Attempts:    Attempts{ByKind: map[string]int{}, ByClass: map[string]int{}},
 		Raw:         newRaw(),
-		Notes:       notes,
+	}
+}
+
+// add accumulates s into r. Everything is additive except the time bounds,
+// LastDoneMs (max) and Aborted (or).
+func (r *Report) add(s *Report) {
+	if !s.StartedAt.IsZero() && (r.StartedAt.IsZero() || s.StartedAt.Before(r.StartedAt)) {
+		r.StartedAt = s.StartedAt
+	}
+	if s.FinishedAt.After(r.FinishedAt) {
+		r.FinishedAt = s.FinishedAt
 	}
 
-	var timeline []TimelinePoint
-	for i := 1; i <= count; i++ {
-		s := byIndex[i]
-		if s == nil {
-			out.Shards = append(out.Shards, ShardSummary{Index: i, Count: count, Missing: true})
-			continue
-		}
-		if out.StartedAt.IsZero() || s.StartedAt.Before(out.StartedAt) {
-			out.StartedAt = s.StartedAt
-		}
-		if s.FinishedAt.After(out.FinishedAt) {
-			out.FinishedAt = s.FinishedAt
-		}
+	r.Totals.Logical += s.Totals.Logical
+	r.Totals.Succeeded += s.Totals.Succeeded
+	r.Totals.Failed += s.Totals.Failed
+	r.Totals.SkippedOverdue += s.Totals.SkippedOverdue
+	r.Totals.Aborted = r.Totals.Aborted || s.Totals.Aborted
+	addCounts(r.Totals.FinalOutcomes, s.Totals.FinalOutcomes)
 
-		out.Totals.Logical += s.Totals.Logical
-		out.Totals.Succeeded += s.Totals.Succeeded
-		out.Totals.Failed += s.Totals.Failed
-		out.Totals.Aborted = out.Totals.Aborted || s.Totals.Aborted
-		addCounts(out.Totals.FinalOutcomes, s.Totals.FinalOutcomes)
+	r.Attempts.Total += s.Attempts.Total
+	addCounts(r.Attempts.ByKind, s.Attempts.ByKind)
+	addCounts(r.Attempts.ByClass, s.Attempts.ByClass)
 
-		out.Attempts.Total += s.Attempts.Total
-		addCounts(out.Attempts.ByKind, s.Attempts.ByKind)
-		addCounts(out.Attempts.ByClass, s.Attempts.ByClass)
-
-		out.Raw.WorkflowOK.Merge(s.Raw.WorkflowOK)
-		out.Raw.WorkflowAll.Merge(s.Raw.WorkflowAll)
-		out.Raw.ArrivalSkew.Merge(s.Raw.ArrivalSkew)
+	if s.Raw != nil {
+		r.Raw.WorkflowOK.Merge(s.Raw.WorkflowOK)
+		r.Raw.WorkflowAll.Merge(s.Raw.WorkflowAll)
+		r.Raw.ArrivalSkew.Merge(s.Raw.ArrivalSkew)
 		for name, h := range s.Raw.Steps {
-			if out.Raw.Steps[name] == nil {
-				out.Raw.Steps[name] = &hist.Histogram{}
+			if r.Raw.Steps[name] == nil {
+				r.Raw.Steps[name] = &hist.Histogram{}
 			}
-			out.Raw.Steps[name].Merge(h)
+			r.Raw.Steps[name].Merge(h)
 		}
-		if s.Raw.LastDoneMs > out.Raw.LastDoneMs {
-			out.Raw.LastDoneMs = s.Raw.LastDoneMs
+		if s.Raw.LastDoneMs > r.Raw.LastDoneMs {
+			r.Raw.LastDoneMs = s.Raw.LastDoneMs
 		}
-
-		// Timeline seconds are relative to the shared start epoch.
-		for _, p := range s.Timeline {
-			for len(timeline) <= p.Second {
-				timeline = append(timeline, TimelinePoint{Second: len(timeline)})
-			}
-			t := &timeline[p.Second]
-			t.Attempts += p.Attempts
-			t.OK += p.OK
-			t.Failed += p.Failed
-			t.Retries += p.Retries
-		}
-
-		out.Shards = append(out.Shards, ShardSummary{
-			Index: i, Count: count, Agent: s.Shard.Agent,
-			Arrivals: s.Shard.Arrivals, Logical: s.Totals.Logical, Attempts: s.Attempts.Total,
-			ArrivalSkewP99Ms: s.ArrivalSkew.P99Ms, Aborted: s.Totals.Aborted,
-		})
 	}
-	out.Timeline = timeline
-	out.Derive()
-	out.Raw = nil // a merged report is a final report
-	sort.Slice(out.Shards, func(a, b int) bool { return out.Shards[a].Index < out.Shards[b].Index })
-	return out, nil
+
+	// Timeline seconds are relative to the shared start epoch.
+	for _, p := range s.Timeline {
+		for len(r.Timeline) <= p.Second {
+			r.Timeline = append(r.Timeline, TimelinePoint{Second: len(r.Timeline)})
+		}
+		t := &r.Timeline[p.Second]
+		t.Attempts += p.Attempts
+		t.OK += p.OK
+		t.Failed += p.Failed
+		t.Retries += p.Retries
+	}
 }
 
 func sameRun(a, b *Report) error {
