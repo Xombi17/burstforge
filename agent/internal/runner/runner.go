@@ -38,6 +38,15 @@ type Options struct {
 	// up. Zero means now + traffic.start_delay.
 	StartAt time.Time
 	Agent   string // name recorded in shard reports
+
+	// Lease-based execution (run --db). With a Lease, the shard starts at
+	// arrival Resume, sends only reserved arrivals, and skips arrivals that
+	// are more than LateLimit overdue when it gets to them.
+	Lease     Lease
+	Resume    int
+	Heartbeat time.Duration // default 1s
+	LeaseTTL  time.Duration // default 5s
+	LateLimit time.Duration // default 1s
 }
 
 func (o *Options) sharded() bool { return o.ShardCount > 0 }
@@ -89,14 +98,30 @@ func withDefaults(opt Options) Options {
 	if opt.Logf == nil {
 		opt.Logf = func(string, ...any) {}
 	}
+	if opt.Heartbeat <= 0 {
+		opt.Heartbeat = time.Second
+	}
+	if opt.LeaseTTL <= 0 {
+		opt.LeaseTTL = 5 * time.Second
+	}
+	if opt.LateLimit <= 0 {
+		opt.LateLimit = time.Second
+	}
 	return opt
+}
+
+func (e *engine) who() string {
+	if !e.opt.sharded() {
+		return ""
+	}
+	return fmt.Sprintf("shard %d/%d: ", e.opt.Shard, e.opt.ShardCount)
 }
 
 // Run drives the whole scenario as a single agent: before hooks, traffic,
 // invariants, thresholds.
 func Run(ctx context.Context, sc *scenario.Scenario, opt Options) (*report.Report, error) {
 	opt = withDefaults(opt)
-	opt.Shard, opt.ShardCount = 0, 0
+	opt.Shard, opt.ShardCount, opt.Lease = 0, 0, nil
 	if err := checkSafety(sc, opt); err != nil {
 		return nil, err
 	}
@@ -123,6 +148,9 @@ func RunShard(ctx context.Context, sc *scenario.Scenario, opt Options) (*report.
 	if !opt.sharded() || opt.Shard < 1 || opt.Shard > opt.ShardCount {
 		return nil, fmt.Errorf("shard %d/%d is out of range", opt.Shard, opt.ShardCount)
 	}
+	if opt.Lease == nil && opt.Resume != 0 {
+		return nil, fmt.Errorf("resume needs a lease")
+	}
 	if err := checkSafety(sc, opt); err != nil {
 		return nil, err
 	}
@@ -148,9 +176,16 @@ func Prepare(ctx context.Context, sc *scenario.Scenario) (map[string]float64, er
 	return before, nil
 }
 
-// Check takes the "after" snapshot, polls the invariants and runs the after
-// hooks. It uses its own context so an interrupted run still gets checked.
-func Check(sc *scenario.Scenario, rep *report.Report, before map[string]float64, logf func(string, ...any)) {
+// TargetCheck is the result of checking the target after load.
+type TargetCheck struct {
+	After      map[string]float64
+	Invariants []report.InvariantCheck
+}
+
+// CheckTarget takes the "after" snapshot (if there is a "before" one), polls
+// the invariants and runs the after hooks. It uses its own context so an
+// interrupted run still gets checked.
+func CheckTarget(sc *scenario.Scenario, before map[string]float64, logf func(string, ...any)) TargetCheck {
 	if logf == nil {
 		logf = func(string, ...any) {}
 	}
@@ -159,26 +194,53 @@ func Check(sc *scenario.Scenario, rep *report.Report, before map[string]float64,
 	c := newControl(sc, 4)
 	defer c.client.CloseIdleConnections()
 
+	var tc TargetCheck
 	if sc.Observe.URL != "" && before != nil {
 		after, err := c.snapshot(ctx)
 		if err != nil {
 			logf("observe snapshot (after) failed: %v", err)
 		} else {
-			rep.TargetStats = targetStats(before, after, rep.Totals.Logical)
+			tc.After = after
 		}
 	}
-
-	invs := make([]report.InvariantCheck, 0, len(sc.Invariants))
+	tc.Invariants = make([]report.InvariantCheck, 0, len(sc.Invariants))
 	for _, inv := range sc.Invariants {
-		invs = append(invs, c.checkInvariant(ctx, inv))
+		tc.Invariants = append(tc.Invariants, c.checkInvariant(ctx, inv))
 	}
-	rep.Invariants = invs
-
 	for _, h := range sc.Hooks.After {
 		if err := c.hook(ctx, h); err != nil {
 			logf("after hook %s %s failed: %v", h.Method, h.Path, err)
 		}
 	}
+	return tc
+}
+
+// Apply puts the check results into rep. Counter deltas are divided by the
+// report's workflow count, so apply to the final report.
+func (tc TargetCheck) Apply(rep *report.Report, before map[string]float64) {
+	if before != nil && tc.After != nil {
+		rep.TargetStats = targetStats(before, tc.After, rep.Totals.Logical)
+	}
+	rep.Invariants = tc.Invariants
+}
+
+// Check is CheckTarget followed by Apply.
+func Check(sc *scenario.Scenario, rep *report.Report, before map[string]float64, logf func(string, ...any)) {
+	CheckTarget(sc, before, logf).Apply(rep, before)
+}
+
+// BaseReport is an empty report carrying the run's identity and plan. The
+// lease-based reducer starts each shard from it.
+func BaseReport(sc *scenario.Scenario, runID string, seed int64) (*report.Report, error) {
+	offsets, err := schedule.Plan(schedule.Profile{
+		Kind: sc.Traffic.Profile, Arrivals: sc.Traffic.Arrivals,
+		Window: sc.Traffic.Window, Duration: sc.Traffic.Duration,
+	}, seed)
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now()
+	return newCollector().build(sc, Options{RunID: runID, Seed: seed}, now, now, offsets), nil
 }
 
 // Evaluate applies the scenario's thresholds and computes the verdict.
@@ -235,50 +297,104 @@ func traffic(ctx context.Context, sc *scenario.Scenario, opt Options) (*report.R
 	e.start = time.Now().Add(lead)
 	e.col.setStart(e.start)
 
-	who := ""
-	if opt.sharded() {
-		who = fmt.Sprintf("shard %d/%d: ", opt.Shard, opt.ShardCount)
-	}
+	who := e.who()
 	if lead < 0 {
 		opt.Logf("%sstart time passed %s ago; arrivals will fire late and the lateness shows up as arrival skew",
 			who, (-lead).Round(time.Millisecond))
 	}
+	if opt.Resume > 0 {
+		opt.Logf("%sresuming at arrival %d of %d (earlier ones were reserved by a previous lease holder)",
+			who, opt.Resume+1, len(mine))
+	}
 	opt.Logf("%sfiring %d of %d arrivals (%s) in %s, planned span %s",
-		who, len(mine), len(offsets), sc.Traffic.Profile, lead.Round(time.Millisecond), offsets[len(offsets)-1].Round(time.Millisecond))
+		who, len(mine)-opt.Resume, len(offsets), sc.Traffic.Profile, lead.Round(time.Millisecond), offsets[len(offsets)-1].Round(time.Millisecond))
 
-	for _, i := range mine {
-		i, off := i, offsets[i]
-		e.wg.Add(1)
-		time.AfterFunc(time.Until(e.start.Add(off)), func() {
-			defer e.wg.Done()
-			e.workflow(ctx, i, off)
-		})
+	var loop *leaseLoop
+	var g *gate
+	if opt.Lease != nil {
+		due := make([]time.Time, len(mine))
+		for k, i := range mine {
+			due[k] = e.start.Add(offsets[i])
+		}
+		loop = startLeaseLoop(e, due)
+		g = loop.gate
 	}
 
-	done := make(chan struct{})
-	go func() { e.wg.Wait(); close(done) }()
-	select {
-	case <-done:
-	case <-ctx.Done():
+	handled := e.dispatch(ctx, mine, offsets, g)
+	// Under a lease, an interrupted agent hands its shard to another agent,
+	// so the interruption is a recovery event, not an aborted run.
+	if ctx.Err() != nil && loop == nil {
 		e.col.setAborted()
-		<-done // workflows observe ctx and return quickly
 	}
+	e.wg.Wait() // workflows observe ctx and return quickly
 	endedAt := time.Now()
+
+	info := &report.ShardInfo{
+		Index:        opt.Shard,
+		Count:        opt.ShardCount,
+		Arrivals:     len(mine),
+		ScenarioHash: sc.Hash(),
+		StartAt:      startAt.Round(0).UTC(),
+		Agent:        opt.Agent,
+	}
+	if loop != nil {
+		ferr := loop.finish(ctx.Err() != nil, handled)
+		base := newCollector().build(sc, opt, startedAt, endedAt, offsets)
+		base.Shard = info
+		rep := report.Sum(base, loop.sent)
+		if ferr != nil && !errors.Is(ferr, ErrFenced) {
+			return rep, fmt.Errorf("handing the shard back: %w", ferr)
+		}
+		return rep, ferr
+	}
 
 	rep := e.col.build(sc, opt, startedAt, endedAt, offsets)
 	if opt.sharded() {
-		rep.Shard = &report.ShardInfo{
-			Index:        opt.Shard,
-			Count:        opt.ShardCount,
-			Arrivals:     len(mine),
-			ScenarioHash: sc.Hash(),
-			StartAt:      startAt.Round(0).UTC(),
-			Agent:        opt.Agent,
-		}
+		rep.Shard = info
 	} else {
 		rep.Raw = nil
 	}
 	return rep, nil
+}
+
+// dispatch starts each arrival's workflow at its planned time, in schedule
+// order. One loop (instead of a timer per arrival) means the arrivals sent so
+// far are always a prefix of the shard, which is what reservations count.
+// It returns how many shard arrivals it handled (sent or skipped).
+func (e *engine) dispatch(ctx context.Context, mine []int, offsets []time.Duration, g *gate) int {
+	timer := time.NewTimer(time.Hour)
+	timer.Stop()
+	k := e.opt.Resume
+	for ; k < len(mine); k++ {
+		if g != nil && !g.wait(ctx, k) {
+			return k
+		}
+		i, off := mine[k], offsets[mine[k]]
+		due := e.start.Add(off)
+		if g != nil && time.Since(due) > e.opt.LateLimit {
+			// Too late to send without changing the load shape.
+			e.col.recordSkipped()
+			continue
+		}
+		if d := time.Until(due); d > 0 {
+			timer.Reset(d)
+			select {
+			case <-timer.C:
+			case <-ctx.Done():
+				timer.Stop()
+				return k
+			}
+		}
+		if ctx.Err() != nil {
+			return k
+		}
+		e.wg.Add(1)
+		go func() {
+			defer e.wg.Done()
+			e.workflow(ctx, i, off)
+		}()
+	}
+	return k
 }
 
 // ------------------------------------------------------------- workflow ---
@@ -685,6 +801,27 @@ type collector struct {
 	byKind, byClass map[string]int
 	attempts        int
 	timeline        map[int]*bucket
+	skipped         int
+}
+
+func (c *collector) recordSkipped() { c.mu.Lock(); c.skipped++; c.mu.Unlock() }
+
+// cut returns everything recorded since the last cut as a chunk and resets
+// the counters. It returns nil if nothing happened.
+func (c *collector) cut() *report.Report {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.attempts == 0 && c.logical == 0 && c.skipped == 0 && c.skew.Count() == 0 {
+		return nil
+	}
+	r := c.buildLocked(nil, Options{}, time.Time{}, time.Time{}, nil)
+	fresh := newCollector()
+	fresh.start, fresh.aborted = c.start, c.aborted
+	c.logical, c.succeeded, c.failed, c.skipped, c.attempts = 0, 0, 0, 0, 0
+	c.outcomes, c.e2eOK, c.e2eAll, c.steps, c.skew = fresh.outcomes, fresh.e2eOK, fresh.e2eAll, fresh.steps, fresh.skew
+	c.byKind, c.byClass, c.timeline = fresh.byKind, fresh.byClass, fresh.timeline
+	c.lastDone = 0
+	return r
 }
 
 func newCollector() *collector {
@@ -767,26 +904,22 @@ func (c *collector) finishWorkflow(ok bool, outcome string, lat time.Duration) {
 func (c *collector) build(sc *scenario.Scenario, opt Options, started, ended time.Time, offsets []time.Duration) *report.Report {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.buildLocked(sc, opt, started, ended, offsets)
+}
 
+// buildLocked turns the counters into a report. With a nil scenario it
+// builds a bare telemetry chunk: counters, histograms and timeline only.
+func (c *collector) buildLocked(sc *scenario.Scenario, opt Options, started, ended time.Time, offsets []time.Duration) *report.Report {
 	r := &report.Report{
-		Schema:      report.SchemaVersion,
-		Tool:        "burstforge " + Version,
-		Scenario:    sc.Name,
-		RunID:       opt.RunID,
-		StartedAt:   started,
-		FinishedAt:  ended,
-		Seed:        opt.Seed,
-		Target:      sc.Target.BaseURL,
-		Environment: sc.Target.Environment,
-		Traffic: report.Traffic{
-			Profile:      sc.Traffic.Profile,
-			Arrivals:     sc.Traffic.Arrivals,
-			PlannedSpan:  float64(offsets[len(offsets)-1].Microseconds()) / 1000,
-			DoubleSubmit: sc.Traffic.DoubleSubmit,
-		},
+		Schema:     report.SchemaVersion,
+		Tool:       "burstforge " + Version,
+		RunID:      opt.RunID,
+		StartedAt:  started,
+		FinishedAt: ended,
+		Seed:       opt.Seed,
 		Totals: report.Totals{
 			Logical: c.logical, Succeeded: c.succeeded, Failed: c.failed,
-			FinalOutcomes: c.outcomes, Aborted: c.aborted,
+			FinalOutcomes: c.outcomes, Aborted: c.aborted, SkippedOverdue: c.skipped,
 		},
 		Attempts: report.Attempts{Total: c.attempts, ByKind: c.byKind, ByClass: c.byClass},
 		Raw: &report.Raw{
@@ -796,6 +929,18 @@ func (c *collector) build(sc *scenario.Scenario, opt Options, started, ended tim
 			Steps:       c.steps,
 			LastDoneMs:  float64(c.lastDone.Microseconds()) / 1000,
 		},
+	}
+
+	if sc != nil {
+		r.Scenario = sc.Name
+		r.Target = sc.Target.BaseURL
+		r.Environment = sc.Target.Environment
+		r.Traffic = report.Traffic{
+			Profile:      sc.Traffic.Profile,
+			Arrivals:     sc.Traffic.Arrivals,
+			PlannedSpan:  float64(offsets[len(offsets)-1].Microseconds()) / 1000,
+			DoubleSubmit: sc.Traffic.DoubleSubmit,
+		}
 	}
 
 	last := -1

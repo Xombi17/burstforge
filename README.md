@@ -8,7 +8,7 @@ The reasoning behind the project, the candidates that were rejected, and the 10-
 
 ## Try it
 
-Needs Go 1.24+ and Node 20+. No other dependencies.
+Needs Go 1.24+ and Node 20+. Lease-based runs (`--db`) also need PostgreSQL (tested on 16).
 
 ```bash
 make build
@@ -94,7 +94,36 @@ bin/burstforge merge checkout.yaml results/launch-1/shard-*.json
 
 `agent` only sends traffic. It runs no hooks and checks no invariants, because those act on the whole target. `merge` refuses shards from different runs or scenarios, counts a shard delivered twice once, and errors if the same shard comes back with different results (two agents ran it). A missing shard is an error. With `--allow-partial` it merges anyway and fails the verdict. Run `merge` right after the agents finish, because it checks invariants against the target as it is now (`--no-check` skips that and marks them unchecked). It has no "before" snapshot, so it doesn't diff target counters. `run --agents` does.
 
-Limits for now: arrival skew is measured on each agent's own clock, so clock offset between machines isn't measured yet (that needs the Week 4 clock-offset handshake). There are no leases either. If an agent dies, its shard is reported missing, not re-run.
+In this mode arrival skew is measured on each agent's own clock, so clock offset between machines isn't measured, and if an agent dies its shard is reported missing, not re-run. The next section fixes both.
+
+### Surviving agent failures (Postgres)
+
+With `--db`, the run lives in Postgres and agents take shards under leases:
+
+```bash
+bin/burstforge run checkout.yaml --db $BURSTFORGE_DB --shards 3 --agents 4
+```
+
+`--agents 4` starts four local workers for three shards, so one is spare. Leave `--agents` out and start workers yourself, on any machine that can reach the database:
+
+```bash
+bin/burstforge agent --db $BURSTFORGE_DB            # works on any open run
+bin/burstforge status --db $BURSTFORGE_DB [run-id]  # shards, leases, who holds what
+bin/burstforge finalize --db $BURSTFORGE_DB <run-id>
+```
+
+How it holds together:
+
+- An agent claims a shard with `FOR UPDATE SKIP LOCKED`, which bumps the shard's epoch. Every heartbeat, reservation and completion is conditional on that epoch and on an unexpired lease, using the database clock. A stalled agent that comes back after losing its lease can't reserve or complete anything.
+- An agent only sends arrivals it has reserved in the database, a couple of heartbeats ahead of the schedule. Whoever takes the shard over starts after the last reserved arrival, so no arrival is sent twice.
+- If an agent stops heartbeating for `--lease-ttl` (default 5s), a spare claims the shard and resumes it. Arrivals that are more than 1s overdue by then are skipped and counted, because sending them all at once would add a burst the plan never had. An agent stopped with Ctrl-C releases its lease and hands back the arrivals it didn't reach, so the takeover is immediate.
+- Telemetry goes up as chunks with sequence numbers and is stored at least once and idempotently. Chunks from an agent that lost its lease are still kept until the run is finalized, because they describe traffic that really went out.
+- When the agent claims a shard, it measures its offset to the database clock and schedules from the shared start time on that clock. It refuses to claim if the measurement is uncertain by more than 100ms.
+- If the coordinator dies, agents finish their shards anyway, and `finalize` closes the run later. It waits for open shards, checks invariants once and stores the report. Running it twice gives the same report.
+
+A run where any arrival didn't go as planned fails its verdict, and the report says how many were unaccounted for (reserved by an agent that died before reporting them), skipped as overdue, or never sent. The target may well be fine; the load just wasn't what the plan said, so rerun before trusting the numbers.
+
+`make recovery` runs the drill: 600 registrations over 30 seconds on three shards and four agents, with the agent holding shard 2 killed by SIGKILL partway through. In two runs here the lease expired within the 3s TTL of the kill, a spare resumed the shard 0.2–0.3s later, and 9 arrivals were unaccounted and 7 skipped. The verdict fails for that reason, so `make recovery` exits 1.
 
 Business invariants need a read-only endpoint on your staging app that exposes the counts you care about (see `GET /_bf/invariants` in [target/server.js](target/server.js) for a 20-line example). Without one, BurstForge still reports latency, failures and amplification.
 
@@ -120,9 +149,9 @@ Unknown YAML fields are rejected, so a typo can't silently disable a limit.
 ## Layout
 
 ```
-agent/        Go: scenario parser, schedule planner, runner, histograms, reports, CLI
+agent/        Go: scenario parser, schedule planner, runner, histograms, reports, Postgres store, CLI
 target/       Node, zero dependencies: the fragile registration app (fragile and hardened profiles)
-scenarios/    smoke, burst and burst-fixed scenarios used by the demo
+scenarios/    smoke, burst and burst-fixed for the demo; sustained for the recovery drill
 docs/         decision doc, roadmap, scenario reference
 scripts/      demo.sh
 ```
@@ -130,10 +159,11 @@ scripts/      demo.sh
 ```bash
 make test     # go vet + unit tests
 make race     # same, under the race detector
+BURSTFORGE_TEST_DB=postgres://... make test-db   # lease and recovery tests against a real Postgres
 ```
 
 ## Status
 
-This is the Week 1–3 slice of the plan: a single agent, or several agents coordinated from one command or by hand. See [docs/ROADMAP.md](docs/ROADMAP.md) for what's done and what's next. Not built yet: Postgres-backed leases and shard recovery, the fault-injection proxy, the control plane and dashboard, Playwright import, the k6 benchmark.
+This is the Week 1–4 slice of the plan: a single agent, several agents coordinated from one command or by hand, or agents working under Postgres leases with takeover of a dead agent's shard. See [docs/ROADMAP.md](docs/ROADMAP.md) for what's done and what's next. Not built yet: the fault-injection proxy, the control plane and dashboard, Playwright import, the k6 benchmark.
 
 The Docker files (`docker-compose.yml`, `agent/Dockerfile`) are written but have not been built or run.
