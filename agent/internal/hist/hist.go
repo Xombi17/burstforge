@@ -6,6 +6,8 @@
 package hist
 
 import (
+	"encoding/json"
+	"fmt"
 	"math"
 	"time"
 )
@@ -109,4 +111,45 @@ func (h *Histogram) Quantile(q float64) time.Duration {
 		}
 	}
 	return h.Max()
+}
+
+// wire is the JSON form: only non-empty buckets, as [index, count] pairs.
+type wire struct {
+	N       uint64      `json:"n"`
+	SumUs   float64     `json:"sum_us"`
+	MinUs   int64       `json:"min_us"`
+	MaxUs   int64       `json:"max_us"`
+	Buckets [][2]uint64 `json:"buckets"`
+}
+
+func (h *Histogram) MarshalJSON() ([]byte, error) {
+	w := wire{N: h.n, SumUs: h.sumUs, MinUs: h.minUs, MaxUs: h.maxUs, Buckets: [][2]uint64{}}
+	for i, c := range h.counts {
+		if c > 0 {
+			w.Buckets = append(w.Buckets, [2]uint64{uint64(i), c})
+		}
+	}
+	return json.Marshal(w)
+}
+
+func (h *Histogram) UnmarshalJSON(b []byte) error {
+	var w wire
+	if err := json.Unmarshal(b, &w); err != nil {
+		return err
+	}
+	var out Histogram
+	var total uint64
+	for _, bc := range w.Buckets {
+		if bc[0] >= numBuckets {
+			return fmt.Errorf("histogram bucket %d out of range", bc[0])
+		}
+		out.counts[bc[0]] += bc[1]
+		total += bc[1]
+	}
+	if total != w.N {
+		return fmt.Errorf("histogram buckets sum to %d, header says %d", total, w.N)
+	}
+	out.n, out.sumUs, out.minUs, out.maxUs = w.N, w.SumUs, w.MinUs, w.MaxUs
+	*h = out
+	return nil
 }

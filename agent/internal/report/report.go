@@ -34,6 +34,11 @@ type Report struct {
 	Thresholds  []ThresholdCheck `json:"thresholds"`
 	Timeline    []TimelinePoint  `json:"timeline"`
 	Verdict     Verdict          `json:"verdict"`
+
+	Notes  []string       `json:"notes,omitempty"`
+	Shard  *ShardInfo     `json:"shard,omitempty"`  // set on a shard report
+	Shards []ShardSummary `json:"shards,omitempty"` // set on a merged report
+	Raw    *Raw           `json:"raw,omitempty"`    // shard reports only
 }
 
 type Traffic struct {
@@ -122,6 +127,11 @@ func (r *Report) Finalize() {
 	var fails []string
 	if r.Totals.Aborted {
 		fails = append(fails, "run was aborted before completion")
+	}
+	for _, s := range r.Shards {
+		if s.Missing {
+			fails = append(fails, fmt.Sprintf("shard %d/%d produced no report; the numbers above cover only the other shards", s.Index, s.Count))
+		}
 	}
 	for _, t := range r.Thresholds {
 		if !t.Pass {
@@ -231,6 +241,25 @@ func (r *Report) Text() string {
 			w("    [%s] %-40s observed %.2f (limit %.2f)", mark(t.Pass), t.Name, t.Observed, t.Limit)
 		}
 	}
+	if len(r.Shards) > 0 {
+		w("")
+		w("  agents")
+		for _, s := range r.Shards {
+			if s.Missing {
+				w("    shard %d/%d  MISSING", s.Index, s.Count)
+				continue
+			}
+			w("    shard %d/%d  %-24s %5d arrivals %6d attempts  skew p99 %s%s",
+				s.Index, s.Count, s.Agent, s.Arrivals, s.Attempts, ms(s.ArrivalSkewP99Ms), abortedTag(s.Aborted))
+		}
+	}
+	if len(r.Notes) > 0 {
+		w("")
+		w("  notes")
+		for _, n := range r.Notes {
+			w("    - %s", n)
+		}
+	}
 	w("")
 	if r.Verdict.Pass {
 		w("VERDICT: PASS")
@@ -262,7 +291,14 @@ func (r *Report) Markdown() string {
 	w("| Started | %s |", r.StartedAt.Format(time.RFC3339))
 	w("| Target | %s (%s) |", r.Target, r.Environment)
 	w("| Traffic | %s, %d arrivals, seed %d, %.0f%% double-submit |", r.Traffic.Profile, r.Traffic.Arrivals, r.Seed, r.Traffic.DoubleSubmit*100)
+	if n := len(r.Shards); n > 0 {
+		w("| Agents | %d (merged from shard reports) |", n)
+	}
 	w("")
+	for _, n := range r.Notes {
+		w("> %s", n)
+		w("")
+	}
 	w("## Summary")
 	w("")
 	w("| Metric | Value |")
@@ -312,6 +348,22 @@ func (r *Report) Markdown() string {
 		}
 		w("")
 	}
+	if len(r.Shards) > 0 {
+		w("## Agents")
+		w("")
+		w("Arrival skew is measured on each agent's own clock against the shared start time.")
+		w("")
+		w("| Shard | Agent | Arrivals | Workflows | Attempts | Skew p99 |")
+		w("|---|---|---:|---:|---:|---:|")
+		for _, s := range r.Shards {
+			if s.Missing {
+				w("| %d/%d | missing | | | | |", s.Index, s.Count)
+				continue
+			}
+			w("| %d/%d | `%s`%s | %d | %d | %d | %s |", s.Index, s.Count, s.Agent, abortedTag(s.Aborted), s.Arrivals, s.Logical, s.Attempts, ms(s.ArrivalSkewP99Ms))
+		}
+		w("")
+	}
 	if len(r.Latency.Steps) > 0 {
 		w("## Per-step attempt latency")
 		w("")
@@ -343,6 +395,13 @@ func (r *Report) Markdown() string {
 		w("")
 	}
 	return b.String()
+}
+
+func abortedTag(a bool) string {
+	if a {
+		return " (aborted)"
+	}
+	return ""
 }
 
 func ms(v float64) string {

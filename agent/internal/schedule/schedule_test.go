@@ -1,6 +1,7 @@
 package schedule
 
 import (
+	"fmt"
 	"reflect"
 	"testing"
 	"time"
@@ -62,5 +63,55 @@ func TestErrors(t *testing.T) {
 	}
 	if _, err := Plan(Profile{Kind: "ramp", Arrivals: 1}, 1); err == nil {
 		t.Error("ramp without duration should fail")
+	}
+}
+
+func TestShardsPartitionThePlan(t *testing.T) {
+	const n = 1000
+	for _, count := range []int{1, 2, 3, 7} {
+		seen := make([]int, n)
+		minLen, maxLen := n, 0
+		for s := 1; s <= count; s++ {
+			idx, err := Shard(n, s, count)
+			if err != nil {
+				t.Fatal(err)
+			}
+			again, _ := Shard(n, s, count)
+			if fmt.Sprint(idx) != fmt.Sprint(again) {
+				t.Fatalf("shard %d/%d is not deterministic", s, count)
+			}
+			for _, i := range idx {
+				seen[i]++
+			}
+			minLen, maxLen = min(minLen, len(idx)), max(maxLen, len(idx))
+		}
+		for i, c := range seen {
+			if c != 1 {
+				t.Fatalf("count %d: arrival %d owned by %d shards", count, i, c)
+			}
+		}
+		if maxLen-minLen > 1 {
+			t.Fatalf("count %d: shard sizes range %d..%d", count, minLen, maxLen)
+		}
+	}
+}
+
+func TestShardsKeepTheBurstShape(t *testing.T) {
+	// Each shard of a burst should span the whole window, not a slice of it.
+	offsets, _ := Plan(Profile{Kind: "burst", Arrivals: 900, Window: time.Second}, 3)
+	for s := 1; s <= 3; s++ {
+		idx, _ := Shard(len(offsets), s, 3)
+		first, last := offsets[idx[0]], offsets[idx[len(idx)-1]]
+		if first > 20*time.Millisecond || last < 980*time.Millisecond {
+			t.Fatalf("shard %d spans %v..%v", s, first, last)
+		}
+	}
+}
+
+func TestShardErrors(t *testing.T) {
+	for _, c := range [][3]int{{10, 0, 3}, {10, 4, 3}, {10, 1, 0}, {2, 1, 3}} {
+		if _, err := Shard(c[0], c[1], c[2]); err == nil {
+			t.Fatalf("Shard%v: expected an error", c)
+		}
 	}
 }

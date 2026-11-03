@@ -61,10 +61,10 @@ Built-in variables: `{{n}}` (arrival index), `{{logical_id}}` (stable per user, 
 | `profile` | `burst`: arrivals land at random inside `window`. `ramp`: rate rises linearly over `duration`. `sustained`: even spacing over `duration`. |
 | `arrivals` | Number of users. |
 | `window` / `duration` | See profile. |
-| `start_delay` | Default `1s`. Gives the agent time to arm its timers. |
+| `start_delay` | Default `1s`. Gives the agent time to arm its timers. `run --agents` waits at least 1s so the agent processes can start. `agent` ignores it and uses `--start-at`. |
 | `double_submit` | Fraction (0 to 1) of users whose final step is sent twice. |
 | `double_submit_delay` | Default `100ms`. |
-| `max_inflight` | Default 5000. If reached, arrivals wait, and the wait shows up as arrival skew. |
+| `max_inflight` | Default 5000. If reached, arrivals wait, and the wait shows up as arrival skew. With several agents this is the total, split evenly between them. |
 
 Schedules depend only on the profile and `--seed`, so a run can be replayed.
 

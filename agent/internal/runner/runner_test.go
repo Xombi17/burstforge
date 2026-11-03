@@ -3,8 +3,10 @@ package runner
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -245,5 +247,153 @@ func TestBackoffMath(t *testing.T) {
 	r.RespectRetryAfter = true
 	if got := backoff(r, 1, nil, 2*time.Second); got != 2*time.Second {
 		t.Errorf("Retry-After should win: %v", got)
+	}
+}
+
+// Three shards of one run, merged through their JSON form, should send the
+// same requests and report the same totals as one agent with the same seed.
+func TestShardedRunMatchesSingleAgent(t *testing.T) {
+	var mu sync.Mutex
+	seen := map[string]int{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		id := r.Header.Get("X-BF-Logical-Id")
+		mu.Lock()
+		seen[id]++
+		n := seen[id]
+		mu.Unlock()
+		if n == 1 && strings.HasSuffix(id, "7") {
+			w.WriteHeader(503) // ids ending in 7 need one retry
+			return
+		}
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	sc := baseScenario(srv.URL)
+	sc.Traffic.Arrivals = 90
+	sc.Traffic.DoubleSubmit = 0.2
+	sc.Workflow.Steps[0].Retry.MaxAttempts = 2
+
+	single, err := Run(context.Background(), sc, Options{Seed: 9, RunID: "r"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	singleSeen := seen
+	seen = map[string]int{}
+
+	dir := t.TempDir()
+	startAt := time.Now().Add(100 * time.Millisecond)
+	var wg sync.WaitGroup
+	paths := make([]string, 3)
+	errs := make([]error, 3)
+	for k := 1; k <= 3; k++ {
+		wg.Add(1)
+		go func(k int) {
+			defer wg.Done()
+			rep, err := RunShard(context.Background(), sc, Options{
+				Seed: 9, RunID: "r", Shard: k, ShardCount: 3, StartAt: startAt, Agent: fmt.Sprintf("a%d", k),
+			})
+			if err != nil {
+				errs[k-1] = err
+				return
+			}
+			paths[k-1] = filepath.Join(dir, fmt.Sprintf("shard-%d.json", k))
+			errs[k-1] = rep.Save(paths[k-1])
+		}(k)
+	}
+	wg.Wait()
+	for _, err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var shards []*report.Report
+	for _, p := range paths {
+		r, err := report.Load(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if r.Shard.Arrivals != 30 || r.Raw == nil {
+			t.Fatalf("shard %d: arrivals %d, raw %v", r.Shard.Index, r.Shard.Arrivals, r.Raw != nil)
+		}
+		shards = append(shards, r)
+	}
+	merged, err := report.Merge(shards, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	Evaluate(sc, merged)
+
+	if fmt.Sprint(seen) != fmt.Sprint(singleSeen) {
+		t.Fatalf("sharded run sent different requests per logical id:\nsharded %v\nsingle  %v", seen, singleSeen)
+	}
+	if merged.Totals.Logical != single.Totals.Logical || merged.Totals.Succeeded != single.Totals.Succeeded {
+		t.Fatalf("totals: merged %+v, single %+v", merged.Totals, single.Totals)
+	}
+	if fmt.Sprint(merged.Attempts.ByKind) != fmt.Sprint(single.Attempts.ByKind) ||
+		merged.Attempts.RetryAmplification != single.Attempts.RetryAmplification {
+		t.Fatalf("attempts: merged %+v, single %+v", merged.Attempts, single.Attempts)
+	}
+	if merged.Latency.WorkflowOK.Count != 90 || merged.ArrivalSkew.Count != 90 {
+		t.Fatalf("merged histogram counts: workflow %d, skew %d", merged.Latency.WorkflowOK.Count, merged.ArrivalSkew.Count)
+	}
+	if len(merged.Shards) != 3 || merged.Raw != nil || !merged.Verdict.Pass {
+		t.Fatalf("merged report: shards %d, raw %v, verdict %+v", len(merged.Shards), merged.Raw != nil, merged.Verdict)
+	}
+	sum := 0
+	for _, p := range merged.Timeline {
+		sum += p.Attempts
+	}
+	if sum != merged.Attempts.Total {
+		t.Fatalf("timeline sums to %d attempts, total is %d", sum, merged.Attempts.Total)
+	}
+}
+
+func TestShardSplitsInflightBudget(t *testing.T) {
+	var cur, peak int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&cur, 1)
+		for {
+			p := atomic.LoadInt32(&peak)
+			if n <= p || atomic.CompareAndSwapInt32(&peak, p, n) {
+				break
+			}
+		}
+		time.Sleep(30 * time.Millisecond)
+		atomic.AddInt32(&cur, -1)
+	}))
+	defer srv.Close()
+
+	sc := baseScenario(srv.URL)
+	sc.Traffic.Arrivals = 40
+	sc.Traffic.MaxInflight = 8
+	if _, err := RunShard(context.Background(), sc, Options{Seed: 1, RunID: "r", Shard: 1, ShardCount: 4}); err != nil {
+		t.Fatal(err)
+	}
+	if peak > 2 {
+		t.Fatalf("one of 4 shards with max_inflight 8 reached %d in flight, want <= 2", peak)
+	}
+}
+
+func TestShardRunsNoHooks(t *testing.T) {
+	var hooks int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/hook" {
+			atomic.AddInt32(&hooks, 1)
+		}
+	}))
+	defer srv.Close()
+	sc := baseScenario(srv.URL)
+	sc.Hooks.Before = []scenario.Call{{Method: "POST", Path: "/hook"}}
+	sc.Hooks.After = []scenario.Call{{Method: "POST", Path: "/hook"}}
+	if _, err := RunShard(context.Background(), sc, Options{Seed: 1, RunID: "r", Shard: 2, ShardCount: 2}); err != nil {
+		t.Fatal(err)
+	}
+	if hooks != 0 {
+		t.Fatalf("shard ran %d hooks; hooks belong to the coordinator", hooks)
+	}
+	if _, err := RunShard(context.Background(), sc, Options{Seed: 1, RunID: "r", Shard: 3, ShardCount: 2}); err == nil {
+		t.Fatal("expected an out-of-range shard error")
 	}
 }
