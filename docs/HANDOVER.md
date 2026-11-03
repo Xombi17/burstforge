@@ -5,14 +5,13 @@ BurstForge is a self-hosted launch-readiness tester for bursty workflows. You gi
 
 ## Where things are
 - Repo: https://github.com/Xombi17/burstforge (public). GitHub is the source of truth; clone fresh.
-- `main` is at `bb6c6e8`. It is the merge of PR #1 (https://github.com/Xombi17/burstforge/pull/1), which brought in Phase 2 (`e425713`, sharding + merge).
-- **Phase 3 is NOT in `main` yet.** It is on branch `claude/sharp-pascal-19gr29`: the Phase 3 commit `3a8e955`, then `a8c7439` (a merge of `main` into the branch, so it contains PR #1's merge commit), then the commit that adds this file (`docs/HANDOVER.md`). No PR is open for it. Start from that branch (`git fetch origin claude/sharp-pascal-19gr29`). Opening a PR for it is my call, so ask me.
-- PR #1 is merged and finished; don't reuse it. Phase 3 needs a new PR. If your session has a different designated branch, base it on `origin/claude/sharp-pascal-19gr29`.
+- `main` has everything below: Phase 2 came in with PR #1 (https://github.com/Xombi17/burstforge/pull/1), Phase 3 and this handover with PR #2 (https://github.com/Xombi17/burstforge/pull/2). Start from `main`.
+- Both PRs are merged and finished. New work goes on a fresh branch cut from `main` and a new PR.
 
 ## Phase numbering (from the first handover's "suggested next steps")
 1. Verify Docker or drop it. **Still open.** No Docker daemon was available in either session.
 2. Sharding across agents + report merge. **Done, merged.**
-3. Week 4: Postgres runs/shards/leases, SKIP LOCKED, heartbeats, fencing, recover a killed agent's shard. **Done, on the branch, not merged.**
+3. Week 4: Postgres runs/shards/leases, SKIP LOCKED, heartbeats, fencing, recover a killed agent's shard. **Done, merged.**
 4. Week 5: fault proxy (latency, timeout, reset, 429, 5xx, packet loss). **Next.**
 5. The people gates (see the end).
 
@@ -65,10 +64,9 @@ Key files:
 - Not built: fault proxy, tenancy/quotas, OpenTelemetry/Prometheus, control plane, dashboard, Playwright/HAR import, k6 benchmark. Nothing claims a k6 result.
 
 ## Suggested next steps (in order)
-1. Phase 3 needs merging: ask me whether to open a PR from `claude/sharp-pascal-19gr29` to `main`.
-2. Docker: verify it if a daemon exists (`docker info`). Otherwise leave it or drop it, and say so. If it gets verified, add a Postgres service.
-3. Phase 4 (Week 5): fault proxy. Latency, timeout, connection reset, 429, 5xx, packet loss, and network presets (high RTT, loss, intermittent). The plan's boundary is "a controlled proxy or mock dependency, never production" (decision.md 10.5, Decision 4). The demo currently toggles faults with `hooks.before` on the target; the proxy should replace that. Keep the safety rules: local/staging only, allow-listed hosts.
-4. Week 6: tenancy, API keys, quotas, plus the stored-target trust gap above; OTel/Prometheus.
+1. Docker: verify it if a daemon exists (`docker info`). Otherwise leave it or drop it, and say so. If it gets verified, add a Postgres service.
+2. Phase 4 (Week 5): fault proxy. Latency, timeout, connection reset, 429, 5xx, packet loss, and network presets (high RTT, loss, intermittent). The plan's boundary is "a controlled proxy or mock dependency, never production" (decision.md 10.5, Decision 4). The demo currently toggles faults with `hooks.before` on the target; the proxy should replace that. Keep the safety rules: local/staging only, allow-listed hosts.
+3. Week 6: tenancy, API keys, quotas, plus the stored-target trust gap above; OTel/Prometheus.
 
 ## The gates (keep reminding me)
 The plan's gates are about people, not code. Week 3: five external teams agree to run a staging test. Week 6: three have completed a real run. I still need to interview 10 operators and do the outreach in section 17 of the decision doc. The code is now at Week 4 while the Week 3 gate is unconfirmed. Ask me where that stands before starting Phase 4, and don't let the code get further ahead.
