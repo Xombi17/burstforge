@@ -1,0 +1,12 @@
+{
+  "name": "bf-target",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Deliberately fragile event-registration app used as a BurstForge test target",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "start:hardened": "PROFILE=hardened node server.js"
+  },
+  "engines": { "node": ">=20" }
+}

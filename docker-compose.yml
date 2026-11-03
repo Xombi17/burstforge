@@ -1,0 +1,27 @@
+# One-command local setup.
+#
+#   docker compose up -d target
+#   docker compose run --rm agent run /scenarios/registration-burst.yaml \
+#       --target http://target:8080 --allow-host target --out /results
+#
+# Reports land in ./results.
+services:
+  target:
+    build: ./target
+    ports: ["8080:8080"]
+    environment:
+      PROFILE: fragile
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/healthz"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+
+  agent:
+    build: ./agent
+    profiles: ["tools"]
+    depends_on:
+      target: { condition: service_healthy }
+    volumes:
+      - ./scenarios:/scenarios:ro
+      - ./results:/results

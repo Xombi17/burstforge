@@ -1,0 +1,49 @@
+# Ten users, one at a time. Everything looks healthy, which is the point:
+# this is the test most teams run before launch.
+name: registration-smoke
+description: Ten sequential registrations against the fragile target.
+
+target:
+  base_url: http://localhost:8080
+  environment: local
+
+hooks:
+  before:
+    - { path: /_bf/config, body: { profile: fragile, ssoLatencyMs: 40 } }
+    - { path: /_bf/reset, body: { seats: 300 } }
+
+workflow:
+  steps:
+    - name: refresh_token
+      method: POST
+      path: /auth/refresh
+      timeout: 3s
+      capture: { token: $.token }
+    - name: register
+      method: POST
+      path: /register
+      timeout: 3s
+      ok_status: [201, 409]
+      headers:
+        Authorization: "Bearer {{token}}"
+        Idempotency-Key: "{{logical_id}}"
+      body:
+        email: "user-{{n}}-{{run_id}}@example.test"
+        name: "User {{n}}"
+
+traffic:
+  profile: sustained
+  arrivals: 10
+  duration: 2s
+
+observe:
+  url: /_bf/stats
+  counters: [sso_calls, db_queries]
+
+invariants:
+  - { name: no duplicate registrations, path: /_bf/invariants, json: $.duplicate_registrations, op: eq, value: 0 }
+  - { name: no oversold seats,          path: /_bf/invariants, json: $.oversold,                op: eq, value: 0 }
+
+thresholds:
+  error_rate: 0.0
+  retry_amplification: 1.5
