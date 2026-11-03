@@ -72,6 +72,7 @@ type NewRun struct {
 	Lead       time.Duration // start_at = database now() + Lead
 	LeaseTTL   time.Duration
 	Before     map[string]float64
+	TrafficURL string // fault proxy agents send workflow traffic to; empty for none
 }
 
 // ShardSize is how many arrivals round-robin sharding gives shard k (1-based).
@@ -98,11 +99,11 @@ func (s *Store) CreateRun(ctx context.Context, nr NewRun) (time.Time, error) {
 	var startAt time.Time
 	err = pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		err := tx.QueryRow(ctx, `
-			INSERT INTO runs (id, scenario_name, scenario, scenario_hash, seed, shard_count, start_at, lease_ttl_ms, before_counters)
-			VALUES ($1, $2, $3, $4, $5, $6, now() + make_interval(secs => $7), $8, $9)
+			INSERT INTO runs (id, scenario_name, scenario, scenario_hash, seed, shard_count, start_at, lease_ttl_ms, before_counters, traffic_url)
+			VALUES ($1, $2, $3, $4, $5, $6, now() + make_interval(secs => $7), $8, $9, nullif($10, ''))
 			RETURNING start_at`,
 			nr.ID, sc.Name, scJSON, sc.Hash(), nr.Seed, nr.ShardCount,
-			nr.Lead.Seconds(), nr.LeaseTTL.Milliseconds(), before,
+			nr.Lead.Seconds(), nr.LeaseTTL.Milliseconds(), before, nr.TrafficURL,
 		).Scan(&startAt)
 		if err != nil {
 			return err
@@ -129,15 +130,16 @@ type Run struct {
 	Status       string
 	Before       map[string]float64
 	CreatedAt    time.Time
+	TrafficURL   string
 }
 
-const runCols = `id, scenario, scenario_hash, seed, shard_count, start_at, lease_ttl_ms, status, before_counters, created_at`
+const runCols = `id, scenario, scenario_hash, seed, shard_count, start_at, lease_ttl_ms, status, before_counters, created_at, coalesce(traffic_url, '')`
 
 func scanRun(row pgx.Row) (*Run, error) {
 	var r Run
 	var scJSON, before []byte
 	var ttlMs int64
-	if err := row.Scan(&r.ID, &scJSON, &r.ScenarioHash, &r.Seed, &r.ShardCount, &r.StartAt, &ttlMs, &r.Status, &before, &r.CreatedAt); err != nil {
+	if err := row.Scan(&r.ID, &scJSON, &r.ScenarioHash, &r.Seed, &r.ShardCount, &r.StartAt, &ttlMs, &r.Status, &before, &r.CreatedAt, &r.TrafficURL); err != nil {
 		return nil, err
 	}
 	r.LeaseTTL = time.Duration(ttlMs) * time.Millisecond
@@ -719,6 +721,7 @@ func RunClaim(ctx context.Context, c *Claim, agent string, clockOffset time.Dura
 		ShardCount:  run.ShardCount,
 		StartAt:     run.StartAt.Add(-clockOffset),
 		Agent:       agent,
+		TrafficURL:  run.TrafficURL,
 		Lease:       c.Lease,
 		Resume:      c.Resume,
 		Heartbeat:   hb,

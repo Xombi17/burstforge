@@ -10,9 +10,11 @@ import (
 	"io"
 	"math/rand"
 	"net/http"
+	"net/http/httptrace"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"burstforge/internal/hist"
@@ -38,6 +40,10 @@ type Options struct {
 	// up. Zero means now + traffic.start_delay.
 	StartAt time.Time
 	Agent   string // name recorded in shard reports
+
+	// TrafficURL, if set, receives the workflow requests instead of
+	// target.base_url: a fault proxy in front of the target.
+	TrafficURL string
 
 	// Lease-based execution (run --db). With a Lease, the shard starts at
 	// arrival Resume, sends only reserved arrivals, and skips arrivals that
@@ -91,6 +97,11 @@ func checkSafety(sc *scenario.Scenario, opt Options) error {
 		return fmt.Errorf("traffic.arrivals %d exceeds the safety cap of %d (raise it with --max-arrivals)",
 			sc.Traffic.Arrivals, opt.MaxArrivals)
 	}
+	if opt.TrafficURL != "" {
+		if err := scenario.CheckHost(opt.TrafficURL, sc.Target.AllowHosts); err != nil {
+			return fmt.Errorf("traffic URL: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -126,15 +137,32 @@ func Run(ctx context.Context, sc *scenario.Scenario, opt Options) (*report.Repor
 		return nil, err
 	}
 	startedAt := time.Now()
+	fs, err := StartFaults(ctx, sc, "127.0.0.1:0")
+	if err != nil {
+		return nil, err
+	}
+	defer fs.Close()
 	before, err := Prepare(ctx, sc)
 	if err != nil {
 		return nil, err
+	}
+	if fs != nil {
+		if opt.StartAt.IsZero() {
+			opt.StartAt = time.Now().Add(sc.Traffic.StartDelay)
+		}
+		if err := fs.Apply(ctx, opt.Seed, opt.StartAt); err != nil {
+			return nil, err
+		}
+		opt.TrafficURL = fs.URL
 	}
 	rep, err := traffic(ctx, sc, opt)
 	if err != nil {
 		return nil, err
 	}
 	rep.StartedAt = startedAt
+	if fs != nil {
+		rep.Faults = fs.Collect(opt.Logf)
+	}
 	Check(sc, rep, before, opt.Logf)
 	Evaluate(sc, rep)
 	return rep, nil
@@ -283,6 +311,9 @@ func traffic(ctx context.Context, sc *scenario.Scenario, opt Options) (*report.R
 		opt:     opt,
 		sem:     make(chan struct{}, inflight),
 		col:     newCollector(),
+	}
+	if opt.TrafficURL != "" {
+		e.base = strings.TrimRight(opt.TrafficURL, "/")
 	}
 	defer e.client.CloseIdleConnections()
 
@@ -484,6 +515,7 @@ func (e *engine) buildRequest(st scenario.Step, vars map[string]string) request 
 	}
 	r.headers["X-BF-Run"] = vars["run_id"]
 	r.headers["X-BF-Logical-Id"] = vars["logical_id"]
+	r.headers["X-BF-Arrival"] = vars["n"] // stable across runs with the same seed
 	return r
 }
 
@@ -536,9 +568,21 @@ func (e *engine) attempt(ctx context.Context, st scenario.Step, r request, n int
 	actx, cancel := context.WithTimeout(ctx, st.Timeout)
 	defer cancel()
 
+	// Go's transport silently resends a "replayable" request after a
+	// connection error on a reused connection, and a POST with an
+	// Idempotency-Key header counts as replayable. Those resends would bypass
+	// the retry policy and the attempt count. Without GetBody a request with
+	// a body can't be replayed; bodiless ones can, so count their writes.
+	var writes atomic.Int32
+	actx = httptrace.WithClientTrace(actx, &httptrace.ClientTrace{
+		WroteRequest: func(httptrace.WroteRequestInfo) { writes.Add(1) },
+	})
 	hr, err := http.NewRequestWithContext(actx, r.method, r.url, bytes.NewReader(r.body))
 	if err != nil {
 		return attemptResult{class: "conn_error", label: "bad_request"}
+	}
+	if len(r.body) > 0 {
+		hr.GetBody = nil
 	}
 	for k, v := range r.headers {
 		hr.Header.Set(k, v)
@@ -574,6 +618,9 @@ func (e *engine) attempt(ctx context.Context, st scenario.Step, r request, n int
 		}
 	}
 	lat := time.Since(t0)
+	for n := writes.Load(); n > 1; n-- {
+		e.col.recordAttempt(st.Name, "transport_retry", "conn_error", -1, t0.Sub(e.start))
+	}
 	e.col.recordAttempt(st.Name, kind, res.class, lat, t0.Sub(e.start))
 	return res
 }
@@ -857,7 +904,9 @@ func (c *collector) recordAttempt(step, kind, class string, lat time.Duration, a
 		h = &hist.Histogram{}
 		c.steps[step] = h
 	}
-	h.Record(lat)
+	if lat >= 0 { // negative: an uncounted resend with no latency of its own
+		h.Record(lat)
+	}
 	c.attempts++
 	c.byKind[kind]++
 	c.byClass[class]++

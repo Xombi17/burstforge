@@ -66,6 +66,19 @@ func coordinateDB(ctx context.Context, path string, sc *scenario.Scenario, sf *s
 	}
 	defer st.Close()
 
+	fs, err := runner.StartFaults(ctx, sc, "127.0.0.1:0")
+	if err != nil {
+		return nil, err
+	}
+	defer fs.Close()
+	trafficURL := ""
+	if fs != nil {
+		trafficURL = fs.URL
+		if fs.Embedded() && agents == 0 {
+			logf("note: the fault proxy is embedded on %s, which agents on other machines can't reach; "+
+				"run `burstforge proxy` and set faults.proxy for remote agents", fs.URL)
+		}
+	}
 	before, err := runner.Prepare(ctx, sc)
 	if err != nil {
 		return nil, err
@@ -73,12 +86,20 @@ func coordinateDB(ctx context.Context, path string, sc *scenario.Scenario, sf *s
 	lead := max(df.lead, sc.Traffic.StartDelay)
 	startAt, err := st.CreateRun(ctx, store.NewRun{
 		ID: runID, Scenario: sc, Seed: seed, ShardCount: df.shards,
-		Lead: lead, LeaseTTL: df.leaseTTL, Before: before,
+		Lead: lead, LeaseTTL: df.leaseTTL, Before: before, TrafficURL: trafficURL,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("storing the run: %w", err)
 	}
 	logf("run stored; first arrival at %s on the database clock (in %s)", startAt.Format("15:04:05.000"), lead)
+	if fs != nil {
+		// Same machine as the embedded proxy, so the database start time
+		// is close enough for every/for windows.
+		if err := fs.Apply(ctx, seed, startAt); err != nil {
+			return nil, err
+		}
+		logf("workflow traffic goes through the fault proxy at %s", fs.URL)
+	}
 	if agents == 0 {
 		logf("waiting for agents. Start them with:  burstforge agent --db <url> --run %s", runID)
 	}
@@ -116,7 +137,11 @@ func coordinateDB(ctx context.Context, path string, sc *scenario.Scenario, sf *s
 	deadline := startAt.Add(time.Duration(base.Traffic.PlannedSpan*float64(time.Millisecond)) + df.drainTimeout)
 	aborted := waitForShards(ctx, st, runID, deadline, &mu)
 
-	rep, err := finalizeRun(st, runID, aborted)
+	var faults *report.FaultReport
+	if fs != nil {
+		faults = fs.Collect(logf)
+	}
+	rep, err := finalizeRun(st, runID, aborted, faults)
 
 	// Workers notice the run is closed within a poll interval; nudge any
 	// that don't.
@@ -189,7 +214,7 @@ func waitForShards(ctx context.Context, st *store.Store, runID string, deadline 
 
 // finalizeRun closes the run: fence open shards, check the target, reduce
 // the telemetry and store the report. Safe to repeat after a crash.
-func finalizeRun(st *store.Store, runID string, aborted bool) (*report.Report, error) {
+func finalizeRun(st *store.Store, runID string, aborted bool, faults *report.FaultReport) (*report.Report, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 	run, err := st.BeginFinalize(ctx, runID)
@@ -203,6 +228,7 @@ func finalizeRun(st *store.Store, runID string, aborted bool) (*report.Report, e
 	tc := runner.CheckTarget(run.Scenario, run.Before, logf)
 	return st.CompleteRun(ctx, runID, func(rep *report.Report) error {
 		tc.Apply(rep, run.Before)
+		rep.Faults = faults
 		rep.Totals.Aborted = rep.Totals.Aborted || aborted
 		runner.Evaluate(run.Scenario, rep)
 		return nil
@@ -344,7 +370,10 @@ func cmdFinalize(args []string) int {
 		// Ctrl-C here means "stop waiting", not "the run was aborted".
 		_ = waitForShards(ctx, st, run.ID, deadline, &sync.Mutex{})
 	}
-	rep, err := finalizeRun(st, run.ID, false)
+	if run.Scenario.Faults.Enabled() {
+		logf("fault counts are only recorded by the coordinator that ran the proxy; this report won't have them")
+	}
+	rep, err := finalizeRun(st, run.ID, false, nil)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		return 2

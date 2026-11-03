@@ -1,18 +1,18 @@
-# Handover: BurstForge (after Phase 3 / plan Week 4)
+# Handover: BurstForge (after Phase 4 / plan Week 5)
 
 ## What this is
 BurstForge is a self-hosted launch-readiness tester for bursty workflows. You give it a staging URL and a workflow. It replays a synchronized burst, measures retry amplification, and checks business invariants afterwards (no duplicate registrations, no oversold seats, no lost jobs). The reasoning, rejected alternatives and 10-week plan are in `docs/decision.md`. Read that first. The decision is made; don't re-litigate it. Then read `README.md`, `docs/ROADMAP.md` and `docs/scenario-reference.md`.
 
 ## Where things are
 - Repo: https://github.com/Xombi17/burstforge (public). GitHub is the source of truth; clone fresh.
-- `main` has everything below: Phase 2 came in with PR #1 (https://github.com/Xombi17/burstforge/pull/1), Phase 3 and this handover with PR #2 (https://github.com/Xombi17/burstforge/pull/2). Start from `main`.
+- `main` has everything below: Phase 2 came in with PR #1 (https://github.com/Xombi17/burstforge/pull/1), Phase 3 and this handover with PR #2 (https://github.com/Xombi17/burstforge/pull/2). Phase 4 (fault proxy) and this update are on branch `claude/sharp-pascal-19gr29` until their PR merges; check `git log origin/main` for "fault" before assuming it's in `main`. Start from `main` once it is.
 - Both PRs are merged and finished. New work goes on a fresh branch cut from `main` and a new PR.
 
 ## Phase numbering (from the first handover's "suggested next steps")
 1. Verify Docker or drop it. **Still open.** No Docker daemon was available in either session.
 2. Sharding across agents + report merge. **Done, merged.**
 3. Week 4: Postgres runs/shards/leases, SKIP LOCKED, heartbeats, fencing, recover a killed agent's shard. **Done, merged.**
-4. Week 5: fault proxy (latency, timeout, reset, 429, 5xx, packet loss). **Next.**
+4. Week 5: fault proxy (latency, timeout, reset, 429, 5xx, packet loss). **Done.**
 5. The people gates (see the end).
 
 ## What exists now
@@ -23,8 +23,9 @@ CLI:
 - `run --agents N`: local coordinator. It runs hooks once, starts N agent processes on a shared start time, merges shard reports, then checks invariants once.
 - `agent <scenario> --shard K/N --seed --run-id --start-at`, then `merge <scenario> shard*.json [--no-check] [--allow-partial]`: the two halves of the above, for separate machines.
 - `run --db URL --shards N [--agents M] [--lease-ttl 5s] [--lead 3s] [--drain-timeout 2m]`: the run lives in Postgres. M local workers are started; with M=0 it waits for external ones.
+- `proxy --upstream URL [--listen ADDR] [--allow-host H]`: standalone fault proxy for agents on other machines. Scenarios with a `faults:` block otherwise get an embedded proxy on 127.0.0.1 started by the coordinator (all three run modes). Manual `agent` takes `--via URL`; `--db` runs store the proxy URL in `runs.traffic_url`.
 - `agent --db URL [--run ID]`: a worker that claims shards. `finalize --db URL <run> [--now]` and `status --db URL [run]`. These three read `--db` from `$BURSTFORGE_DB` if it isn't given; `run` needs an explicit `--db`.
-- Make targets: `make test`, `make race`, `make demo`, `make test-db` (needs `BURSTFORGE_TEST_DB`), `make recovery` (needs `BURSTFORGE_DB`; exits 1 by design because the verdict fails).
+- Make targets: `make test`, `make race`, `make demo`, `make faults` (Week 5 drill, fragile vs hardened, same seed), `make test-db` (needs `BURSTFORGE_TEST_DB`), `make recovery` (needs `BURSTFORGE_DB`; exits 1 by design because the verdict fails).
 
 Key files:
 - `agent/internal/schedule/schedule.go` (`Plan`, `Shard`)
@@ -32,6 +33,7 @@ Key files:
 - `agent/internal/runner/runner.go` (`Run`, `RunShard`, `Prepare`, `CheckTarget`/`Apply`, `Evaluate`, `BaseReport`, the dispatcher)
 - `agent/internal/runner/lease.go` (the `Lease` interface, `ErrFenced`, the heartbeat/reservation loop)
 - `agent/internal/store/{schema.sql,store.go}` (Postgres)
+- `agent/internal/faultproxy/{rules.go,proxy.go}` (rules, presets, proxy, control API at `/_bfproxy/`), `agent/internal/runner/faults.go` (per-run fault session)
 - `agent/cmd/burstforge/{main.go,db.go}`
 - `scripts/{demo.sh,recovery-demo.sh}`
 
@@ -47,6 +49,8 @@ Key files:
 - One dispatcher loop replaced the per-arrival timers, so sent arrivals are always a prefix of the shard.
 - `finalize`: `BeginFinalize` fences open shards and sets the run to finalizing. Invariants are checked outside the lock. Then `CompleteRun` reduces the chunks and stores the report under `FOR UPDATE` on the run row. It's safe to repeat. A manual `finalize` waits for open shards unless `--now`.
 - The verdict fails if any arrival was unaccounted, skipped or never sent, even if the target looks fine.
+- Faults: only workflow traffic goes through the proxy; hooks, snapshots and invariants go to the target directly. Rules match path prefix and method, at a rate, `phase: before` (target never sees it) or `after` (target handles it, then the response is delayed or dropped). Latency rules add up; at most one of status/reset/timeout applies per request. Fault decisions hash (seed, rule, `X-BF-Arrival`, `X-BF-Attempt`, method, path), so the same seed faults the same first attempts across runs. Packet loss is approximated (retransmit-sized delay + rare reset); real loss needs tc/netem, and the docs say so.
+- The runner sets `GetBody = nil` on requests with a body so Go's transport can't silently resend them, and counts any resend of a bodiless request as a `transport_retry` attempt. Before this, a POST with an `Idempotency-Key` could be resent uncounted after a connection error. The proxy's request count should equal the run's attempts; a test asserts it.
 
 ## Verified (in the Phase 2 and 3 sessions)
 - `make test` and `make race` pass. `make test-db` (store + runner under race) passes against Postgres 16.
@@ -55,21 +59,23 @@ Key files:
 - Ctrl-C on an agent: takeover 0.1s later, 1 arrival unaccounted (the in-flight request).
 - Coordinator killed with `kill -9`: agents finished, and a later `finalize` gave PASS. Repeating it returned the stored report.
 - No agents: the drain deadline abandons the shards and the report says nothing was sent.
-- `make demo` unchanged. Fragile duplicates were 7–9 in recent runs (README range is 5–9).
+- `make demo` unchanged. Fragile duplicates were 7–12 in recent runs (README range is 5–12).
+- Faults (Phase 4): proxy unit tests and runner integration tests pass under race, including proxy requests == runner attempts and same faults across different run IDs. `make faults` (seed 21): SSO calls per workflow 2.46 vs 1.00, amplification 1.23x vs 1.05x, 31 users told "already registered" vs 0, 32 idempotent replays on the hardened side. Faults also verified with `--agents 3`, `--db` (3 shards), and a standalone `burstforge proxy` (same injected counts as embedded).
 
 ## Not verified or not built
 - Docker: `docker-compose.yml` and `agent/Dockerfile` have never been built. Compose has no Postgres service.
 - Multi-machine runs: everything ran as local processes on one container. Clock-offset handling across real hosts is untested.
 - Agents trust the target and allow-list stored in the database. That needs per-tenant checks before anyone else can write runs (Week 6).
-- Not built: fault proxy, tenancy/quotas, OpenTelemetry/Prometheus, control plane, dashboard, Playwright/HAR import, k6 benchmark. Nothing claims a k6 result.
+- `finalize` run separately from the coordinator has no fault counts; only the coordinator reads the proxy's stats.
+- Not built: tenancy/quotas, OpenTelemetry/Prometheus, control plane, dashboard, Playwright/HAR import, k6 benchmark. Nothing claims a k6 result.
 
 ## Suggested next steps (in order)
-1. Docker: verify it if a daemon exists (`docker info`). Otherwise leave it or drop it, and say so. If it gets verified, add a Postgres service.
-2. Phase 4 (Week 5): fault proxy. Latency, timeout, connection reset, 429, 5xx, packet loss, and network presets (high RTT, loss, intermittent). The plan's boundary is "a controlled proxy or mock dependency, never production" (decision.md 10.5, Decision 4). The demo currently toggles faults with `hooks.before` on the target; the proxy should replace that. Keep the safety rules: local/staging only, allow-listed hosts.
-3. Week 6: tenancy, API keys, quotas, plus the stored-target trust gap above; OTel/Prometheus.
+1. Docker: verify it if a daemon exists (`docker info`). Otherwise leave it or drop it, and say so. If it gets verified, add Postgres and the fault proxy as services.
+2. Week 6: organizations, API keys, quotas and rate limits, plus the stored-target trust gap above (agents must check targets per tenant, not trust the database). OpenTelemetry export and Prometheus metrics. Telemetry chunks with sequence numbers already exist (Week 4).
+3. Week 7 is the dashboard; the plan says cut the dashboard before cutting recovery, faults or invariants.
 
 ## The gates (keep reminding me)
-The plan's gates are about people, not code. Week 3: five external teams agree to run a staging test. Week 6: three have completed a real run. I still need to interview 10 operators and do the outreach in section 17 of the decision doc. The code is now at Week 4 while the Week 3 gate is unconfirmed. Ask me where that stands before starting Phase 4, and don't let the code get further ahead.
+The plan's gates are about people, not code. Week 3: five external teams agree to run a staging test. Week 6: three have completed a real run. I still need to interview 10 operators and do the outreach in section 17 of the decision doc. The code is now at Week 5 while the Week 3 gate is unconfirmed, and Week 6's gate (three teams completed a real run) is next. Ask me where outreach stands before starting Week 6 work, and don't let the code get further ahead.
 
 ## Working preferences
 - Commits authored as `Xombi17 <Xombi17@users.noreply.github.com>`. No `Co-Authored-By`, no Claude attribution, no session links in commits or PRs.

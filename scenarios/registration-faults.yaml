@@ -1,0 +1,62 @@
+# The plan's Week 5 drill, with the faults injected by the BurstForge proxy
+# instead of the target's own knobs. The SSO itself is fast here; the proxy
+# makes 30% of token refreshes answer 2s late, after the SSO has already done
+# the work, and loses 10% of registration responses after the registration
+# went through. The client gives up after 1.5s and retries at once.
+name: registration-faults
+description: 300 arrivals, proxy-injected SSO latency and lost responses, naive client retries.
+
+target:
+  base_url: http://localhost:8080
+  environment: local
+
+hooks:
+  before:
+    - { path: /_bf/config, body: { profile: fragile, ssoLatencyMs: 40, ssoTimeoutMs: 4000, ssoConcurrency: 250 } }
+    - { path: /_bf/reset, body: { seats: 400 } }
+  after:
+    - { path: /_bf/config, body: { ssoLatencyMs: 40, ssoTimeoutMs: 800, ssoConcurrency: 25 } }
+
+workflow:
+  steps:
+    - name: refresh_token
+      method: POST
+      path: /auth/refresh
+      timeout: 1500ms
+      retry: { max_attempts: 3, backoff: none, on: [timeout, conn, 5xx] }
+      capture: { token: $.token }
+    - name: register
+      method: POST
+      path: /register
+      timeout: 4s
+      ok_status: [201, 409]
+      retry: { max_attempts: 3, backoff: none, on: [timeout, conn, 5xx] }
+      headers:
+        Authorization: "Bearer {{token}}"
+        Idempotency-Key: "{{logical_id}}"
+      body:
+        email: "user-{{n}}-{{run_id}}@example.test"
+        name: "User {{n}}"
+
+traffic:
+  profile: burst
+  arrivals: 300
+  window: 2s
+
+faults:
+  rules:
+    - { name: slow SSO, path: /auth/refresh, latency: 2s, jitter: 300ms, phase: after, rate: 0.3 }
+    - { name: lost confirmation, path: /register, reset: true, phase: after, rate: 0.1 }
+
+observe:
+  url: /_bf/stats
+  counters: [req_register, sso_calls, db_queries, idempotent_replays]
+
+invariants:
+  - { name: no duplicate registrations, path: /_bf/invariants, json: $.duplicate_registrations, op: eq, value: 0 }
+  - { name: no oversold seats,          path: /_bf/invariants, json: $.oversold,                op: eq, value: 0 }
+  - { name: no lost confirmation jobs,  path: /_bf/invariants, json: $.jobs_lost,               op: eq, value: 0, eventually: 20s }
+
+thresholds:
+  error_rate: 0.02
+  retry_amplification: 1.3

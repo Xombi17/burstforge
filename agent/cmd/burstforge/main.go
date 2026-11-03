@@ -21,6 +21,7 @@ import (
 	"syscall"
 	"time"
 
+	"burstforge/internal/faultproxy"
 	"burstforge/internal/report"
 	"burstforge/internal/runner"
 	"burstforge/internal/scenario"
@@ -32,10 +33,11 @@ Usage:
   burstforge validate <scenario.yaml>
   burstforge run <scenario.yaml> [--agents N] [--out DIR] [--seed N] [scenario flags]
   burstforge agent <scenario.yaml> --shard K/N --seed N --run-id ID --start-at TIME
-                                   [--out DIR] [--name NAME] [scenario flags]
+                                   [--via URL] [--out DIR] [--name NAME] [scenario flags]
   burstforge merge <scenario.yaml> <shard.json>... [--out DIR] [--no-check]
                                    [--allow-partial] [scenario flags]
   burstforge compare <before/report.json> <after/report.json>
+  burstforge proxy --upstream URL [--listen ADDR] [--allow-host HOST]
 
 With Postgres (leases, heartbeats, takeover of a dead agent's shard):
   burstforge run <scenario.yaml> --db URL --shards N [--agents M] [--lease-ttl D]
@@ -75,6 +77,8 @@ func main() {
 		code = cmdFinalize(os.Args[2:])
 	case "status":
 		code = cmdStatus(os.Args[2:])
+	case "proxy":
+		code = cmdProxy(os.Args[2:])
 	case "version", "--version":
 		fmt.Println("burstforge", runner.Version)
 	case "help", "-h", "--help":
@@ -254,6 +258,11 @@ func coordinate(ctx context.Context, path string, sc *scenario.Scenario, sf *sce
 	}
 
 	startedAt := time.Now()
+	fs, err := runner.StartFaults(ctx, sc, "127.0.0.1:0")
+	if err != nil {
+		return nil, err
+	}
+	defer fs.Close()
 	before, err := runner.Prepare(ctx, sc)
 	if err != nil {
 		return nil, err
@@ -266,6 +275,14 @@ func coordinate(ctx context.Context, path string, sc *scenario.Scenario, sf *sce
 	}
 	startAt := time.Now().Add(lead).UTC()
 	logf("starting %d agents, shared start %s (in %s)", n, startAt.Format("15:04:05.000"), lead)
+	var via []string
+	if fs != nil {
+		if err := fs.Apply(ctx, seed, startAt); err != nil {
+			return nil, err
+		}
+		via = []string{"--via", fs.URL}
+		logf("workflow traffic goes through the fault proxy at %s", fs.URL)
+	}
 
 	dir := filepath.Join(out, runID)
 	var mu sync.Mutex // serializes agent output lines
@@ -280,7 +297,7 @@ func coordinate(ctx context.Context, path string, sc *scenario.Scenario, sf *sce
 			"--start-at", startAt.Format(time.RFC3339Nano),
 			"--out", out,
 			"--name", fmt.Sprintf("local-%d", k),
-		}, sf.args()...)...)
+		}, append(via, sf.args()...)...)...)
 		// On Ctrl-C, ask agents to stop and write a partial shard report
 		// rather than killing them outright.
 		cmd.Cancel = func() error { return cmd.Process.Signal(os.Interrupt) }
@@ -332,6 +349,9 @@ func coordinate(ctx context.Context, path string, sc *scenario.Scenario, sf *sce
 	}
 	rep.StartedAt = startedAt
 	rep.Notes = append(rep.Notes, notes...)
+	if fs != nil {
+		rep.Faults = fs.Collect(logf)
+	}
 	runner.Check(sc, rep, before, logf)
 	runner.Evaluate(sc, rep)
 	return rep, nil
@@ -376,6 +396,7 @@ func cmdAgent(args []string) int {
 	runID := fs.String("run-id", "", "run ID shared by every shard of the run (required)")
 	startArg := fs.String("start-at", "", "shared start time: RFC 3339 or unix milliseconds (required)")
 	name := fs.String("name", "", "agent name recorded in the report (default host-pid)")
+	via := fs.String("via", "", "send workflow traffic here instead of target.base_url (a fault proxy)")
 	sf := addScenarioFlags(fs)
 	pos, err := parse(fs, args)
 	if err != nil || len(pos) != 1 {
@@ -416,7 +437,7 @@ func cmdAgent(args []string) int {
 
 	rep, err := runner.RunShard(ctx, sc, runner.Options{
 		Seed: *seed, RunID: *runID, MaxArrivals: sf.maxArrivals, Logf: logf,
-		Shard: k, ShardCount: n, StartAt: startAt, Agent: *name,
+		Shard: k, ShardCount: n, StartAt: startAt, Agent: *name, TrafficURL: *via,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
@@ -568,4 +589,41 @@ func shortID() string {
 	b := make([]byte, 2)
 	_, _ = rand.Read(b)
 	return hex.EncodeToString(b)
+}
+
+func cmdProxy(args []string) int {
+	fs := flag.NewFlagSet("proxy", flag.ContinueOnError)
+	upstream := fs.String("upstream", "", "the staging target to forward to (required)")
+	listen := fs.String("listen", "127.0.0.1:8081", "address to listen on")
+	allowHost := fs.String("allow-host", "", "allow an upstream host that is not loopback or private")
+	pos, err := parse(fs, args)
+	if err != nil || len(pos) != 0 || *upstream == "" {
+		fmt.Fprintln(os.Stderr, "usage: burstforge proxy --upstream URL [--listen ADDR] [--allow-host HOST]")
+		return 2
+	}
+	var allow []string
+	if *allowHost != "" {
+		allow = []string{*allowHost}
+	}
+	if err := scenario.CheckHost(*upstream, allow); err != nil {
+		fmt.Fprintf(os.Stderr, "--upstream: %v (for the proxy, allow a host with --allow-host)\n", err)
+		return 2
+	}
+	p, err := faultproxy.New(*upstream)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 2
+	}
+	e, err := faultproxy.Start(p, *listen)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 2
+	}
+	fmt.Printf("fault proxy on %s -> %s (no faults until a run configures them)\n", e.URL, *upstream)
+	fmt.Printf("set faults.proxy: %s in the scenario, or use it with --via\n", e.URL)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	<-ctx.Done()
+	_ = e.Close()
+	return 0
 }

@@ -21,6 +21,10 @@ CREATE TABLE IF NOT EXISTS runs (
 
 -- One row per shard. epoch is the fencing token: every claim and every
 -- abandonment bumps it, and every write an agent makes is conditional on it.
+-- Added in Week 5: where agents send workflow traffic (a fault proxy), if
+-- not the scenario's base_url.
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS traffic_url text;
+
 CREATE TABLE IF NOT EXISTS run_shards (
     run_id           text NOT NULL REFERENCES runs (id) ON DELETE CASCADE,
     shard_no         int NOT NULL CHECK (shard_no > 0),

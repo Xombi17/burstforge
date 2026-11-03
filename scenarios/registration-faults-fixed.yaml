@@ -1,0 +1,61 @@
+# Same faults as registration-faults.yaml: with the same seed, the same
+# arrivals and attempt numbers are faulted (retries differ by client policy),
+# against the hardened target with a client that waits longer, backs off with
+# jitter, and sends an idempotency key the server honors.
+name: registration-faults-fixed
+description: 300 arrivals, same proxy-injected faults, hardened target and polite retries.
+
+target:
+  base_url: http://localhost:8080
+  environment: local
+
+hooks:
+  before:
+    - { path: /_bf/config, body: { profile: hardened, ssoLatencyMs: 40, ssoTimeoutMs: 4000, ssoConcurrency: 250 } }
+    - { path: /_bf/reset, body: { seats: 400 } }
+  after:
+    - { path: /_bf/config, body: { ssoLatencyMs: 40, ssoTimeoutMs: 800, ssoConcurrency: 25 } }
+
+workflow:
+  steps:
+    - name: refresh_token
+      method: POST
+      path: /auth/refresh
+      timeout: 3s
+      retry: { max_attempts: 3, backoff: exponential, base_delay: 300ms, max_delay: 2s, jitter: full, respect_retry_after: true, on: [timeout, conn, 429, 5xx] }
+      capture: { token: $.token }
+    - name: register
+      method: POST
+      path: /register
+      timeout: 4s
+      ok_status: [201, 409]
+      retry: { max_attempts: 3, backoff: exponential, base_delay: 300ms, max_delay: 2s, jitter: full, respect_retry_after: true, on: [timeout, conn, 429, 5xx] }
+      headers:
+        Authorization: "Bearer {{token}}"
+        Idempotency-Key: "{{logical_id}}"
+      body:
+        email: "user-{{n}}-{{run_id}}@example.test"
+        name: "User {{n}}"
+
+traffic:
+  profile: burst
+  arrivals: 300
+  window: 2s
+
+faults:
+  rules:
+    - { name: slow SSO, path: /auth/refresh, latency: 2s, jitter: 300ms, phase: after, rate: 0.3 }
+    - { name: lost confirmation, path: /register, reset: true, phase: after, rate: 0.1 }
+
+observe:
+  url: /_bf/stats
+  counters: [req_register, sso_calls, db_queries, idempotent_replays]
+
+invariants:
+  - { name: no duplicate registrations, path: /_bf/invariants, json: $.duplicate_registrations, op: eq, value: 0 }
+  - { name: no oversold seats,          path: /_bf/invariants, json: $.oversold,                op: eq, value: 0 }
+  - { name: no lost confirmation jobs,  path: /_bf/invariants, json: $.jobs_lost,               op: eq, value: 0, eventually: 20s }
+
+thresholds:
+  error_rate: 0.02
+  retry_amplification: 1.3

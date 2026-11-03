@@ -1,4 +1,4 @@
-.PHONY: build test race test-db target smoke burst fixed compare demo recovery clean
+.PHONY: build test race test-db target smoke burst fixed compare demo faults recovery clean
 
 BIN := bin/burstforge
 OUT := results
@@ -34,6 +34,10 @@ fixed: build
 # Full before/after story. Starts and stops its own target.
 demo: build
 	./scripts/demo.sh
+
+# Same proxy-injected faults against the fragile and hardened target.
+faults: build
+	./scripts/faults-demo.sh
 
 # Kill an agent mid-run and watch its shard get taken over. Needs BURSTFORGE_DB.
 recovery: build

@@ -18,6 +18,8 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"burstforge/internal/faultproxy"
 )
 
 type Scenario struct {
@@ -31,7 +33,20 @@ type Scenario struct {
 	Observe    Observe     `yaml:"observe"`
 	Thresholds Thresholds  `yaml:"thresholds"`
 	Invariants []Invariant `yaml:"invariants"`
+	Faults     Faults      `yaml:"faults"`
 }
+
+// Faults are injected by a proxy between the agents and the target. Hooks,
+// counter snapshots and invariant checks go to the target directly.
+type Faults struct {
+	// Proxy is the URL of a running `burstforge proxy`. Empty means the
+	// coordinator starts one on 127.0.0.1, which only local agents can reach.
+	Proxy  string            `yaml:"proxy"`
+	Preset string            `yaml:"preset"` // high-rtt | lossy | intermittent | mobile-3g
+	Rules  []faultproxy.Rule `yaml:"rules"`
+}
+
+func (f Faults) Enabled() bool { return f.Preset != "" || len(f.Rules) > 0 }
 
 type Target struct {
 	BaseURL     string   `yaml:"base_url"`
@@ -294,18 +309,49 @@ func (s *Scenario) Validate() error {
 			add("%s.op must be eq, lt, lte, gt or gte", at)
 		}
 	}
+	if f := s.Faults; f.Proxy != "" || f.Enabled() {
+		if f.Proxy != "" {
+			if u, err := url.Parse(f.Proxy); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+				add("faults.proxy must be an http(s) URL, got %q", f.Proxy)
+			}
+			if !f.Enabled() {
+				add("faults.proxy is set but there is no preset and no rules")
+			}
+		}
+		if _, err := faultproxy.Expand(f.Preset, nil); err != nil {
+			add("faults.preset: %v", err)
+		}
+		for i, r := range f.Rules {
+			if err := r.Validate(); err != nil {
+				add("faults.rules[%d]: %v", i, err)
+			}
+		}
+	}
 	return errors.Join(errs...)
 }
 
 // CheckTarget enforces the safety rules: explicit environment, and a host that
 // is loopback, private, or listed in target.allow_hosts.
 func (s *Scenario) CheckTarget() error {
-	u, err := url.Parse(s.Target.BaseURL)
+	if err := CheckHost(s.Target.BaseURL, s.Target.AllowHosts); err != nil {
+		return err
+	}
+	if s.Faults.Proxy != "" {
+		if err := CheckHost(s.Faults.Proxy, s.Target.AllowHosts); err != nil {
+			return fmt.Errorf("faults.proxy: %w", err)
+		}
+	}
+	return nil
+}
+
+// CheckHost refuses URLs whose host is not loopback, private or allowed.
+func CheckHost(raw string, allow []string) error {
+	u, err := url.Parse(raw)
 	if err != nil {
 		return err
 	}
 	host := u.Hostname()
-	for _, h := range s.Target.AllowHosts {
+	for _, h := range allow {
 		if strings.EqualFold(h, host) {
 			return nil
 		}

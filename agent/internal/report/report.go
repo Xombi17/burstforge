@@ -41,6 +41,7 @@ type Report struct {
 	Raw    *Raw           `json:"raw,omitempty"`    // shard reports only
 
 	Recovery    *Recovery    `json:"recovery,omitempty"`     // set on lease-based runs
+	Faults      *FaultReport `json:"faults,omitempty"`       // set when a fault proxy was used
 	ShardDetail *ShardDetail `json:"shard_detail,omitempty"` // reducer-internal
 }
 
@@ -230,6 +231,13 @@ func (r *Report) Text() string {
 	}
 	w("  arrival skew  p50 %s  p99 %s  max %s", ms(r.ArrivalSkew.P50Ms), ms(r.ArrivalSkew.P99Ms), ms(r.ArrivalSkew.MaxMs))
 
+	if f := r.Faults; f != nil {
+		w("")
+		w("  faults        %d requests through the %s proxy, %d upstream errors", f.Requests, f.Proxy, f.UpstreamErrors)
+		for _, fr := range f.Rules {
+			w("    injected %5d of %5d  %s", fr.Injected, fr.Matched, fr.Rule)
+		}
+	}
 	if ts := r.TargetStats; ts != nil && len(ts.Delta) > 0 {
 		w("")
 		w("  target counters (delta, per workflow)")
@@ -336,6 +344,18 @@ func (r *Report) Markdown() string {
 	w("Attempts by kind: %s. By class: %s.", kinds(r.Attempts.ByKind), kinds(r.Attempts.ByClass))
 	w("")
 
+	if f := r.Faults; f != nil {
+		w("## Injected faults")
+		w("")
+		w("%d requests went through the %s fault proxy; the target itself failed to answer %d.", f.Requests, f.Proxy, f.UpstreamErrors)
+		w("")
+		w("| Rule | Matched | Injected |")
+		w("|---|---:|---:|")
+		for _, fr := range f.Rules {
+			w("| %s | %d | %d |", fr.Rule, fr.Matched, fr.Injected)
+		}
+		w("")
+	}
 	if len(r.Invariants) > 0 {
 		w("## Business invariants")
 		w("")

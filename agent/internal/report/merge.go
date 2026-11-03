@@ -316,3 +316,17 @@ func addCounts(dst, src map[string]int) {
 		dst[k] += v
 	}
 }
+
+// FaultReport is what the fault proxy injected during the run.
+type FaultReport struct {
+	Proxy          string          `json:"proxy"` // "embedded" or the proxy URL
+	Requests       int64           `json:"requests"`
+	UpstreamErrors int64           `json:"upstream_errors"`
+	Rules          []FaultRuleStat `json:"rules"`
+}
+
+type FaultRuleStat struct {
+	Rule     string `json:"rule"`
+	Matched  int64  `json:"matched"`
+	Injected int64  `json:"injected"`
+}

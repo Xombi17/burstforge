@@ -27,7 +27,7 @@ Typical numbers from the fragile run (they move a little between runs because th
 | | fragile | hardened |
 |---|---:|---:|
 | HTTP error rate | 0% | 0% |
-| Duplicate registrations | 5–9 | 0 |
+| Duplicate registrations | 5–12 | 0 |
 | Oversold seats | 0–3 | 0 |
 | Confirmation jobs lost | ~50 | 0 |
 | Latency p99 | ~9–10 s | ~5.5 s |
@@ -96,6 +96,32 @@ bin/burstforge merge checkout.yaml results/launch-1/shard-*.json
 
 In this mode arrival skew is measured on each agent's own clock, so clock offset between machines isn't measured, and if an agent dies its shard is reported missing, not re-run. The next section fixes both.
 
+### Injecting faults
+
+Add a `faults:` block to a scenario and the workflow traffic goes through a proxy that adds latency, error statuses, connection resets or timeouts, per path and at a given rate (see [docs/scenario-reference.md](docs/scenario-reference.md#faults)). With `phase: after`, the target handles the request and then the response is delayed or dropped. That's the case where a server did the work, the client never heard back, and a retry finds out whether the endpoint is idempotent.
+
+The coordinator starts the proxy itself on 127.0.0.1. Agents on other machines need a standalone one:
+
+```bash
+bin/burstforge proxy --upstream http://staging.internal:8080 --listen 0.0.0.0:8081 --allow-host staging.internal
+```
+
+and `faults.proxy: http://<proxy-host>:8081` in the scenario. The report lists every rule with how many requests it matched and how many it faulted, and the proxy's request count should equal the run's HTTP attempts.
+
+`make faults` runs the Week 5 drill twice with the same seed: 300 arrivals, 30% of token refreshes answered 2s late after the SSO did the work, and 10% of registration responses lost after the registration went through. One pair of runs here:
+
+| | fragile, immediate retries | hardened, backoff + idempotency key |
+|---|---:|---:|
+| SSO calls per workflow | 2.46 | 1.00 |
+| Retry amplification | 1.23x | 1.05x |
+| Users told "already registered" after their own registration succeeded | 31 | 0 |
+| Lost responses answered from the idempotency record | 0 | 32 |
+| Latency p50 | 247ms | 930ms |
+
+The hardened client is slower at the median because it waits up to 3s for a token instead of giving up at 1.5s. The fragile run also loses confirmation jobs (33–34 here), but its queue does that under load without any injected faults, so don't read that row as caused by the proxy.
+
+Building the proxy turned up a measurement bug that affected every earlier phase. Go's HTTP client silently resends a request after a connection error on a reused connection if it considers the request replayable, which includes a POST with an `Idempotency-Key` header. Those resends bypassed the retry policy and weren't counted. Requests with a body are no longer resent, and any resend of a bodiless request is counted as a `transport_retry` attempt. The earlier demo runs had no connection errors, so their numbers weren't affected.
+
 ### Surviving agent failures (Postgres)
 
 With `--db`, the run lives in Postgres and agents take shards under leases:
@@ -151,7 +177,8 @@ Unknown YAML fields are rejected, so a typo can't silently disable a limit.
 ```
 agent/        Go: scenario parser, schedule planner, runner, histograms, reports, Postgres store, CLI
 target/       Node, zero dependencies: the fragile registration app (fragile and hardened profiles)
-scenarios/    smoke, burst and burst-fixed for the demo; sustained for the recovery drill
+scenarios/    smoke, burst and burst-fixed for the demo; faults and faults-fixed for the fault drill;
+              sustained for the recovery drill
 docs/         decision doc, roadmap, scenario reference
 scripts/      demo.sh
 ```
@@ -164,6 +191,6 @@ BURSTFORGE_TEST_DB=postgres://... make test-db   # lease and recovery tests agai
 
 ## Status
 
-This is the Week 1–4 slice of the plan: a single agent, several agents coordinated from one command or by hand, or agents working under Postgres leases with takeover of a dead agent's shard. See [docs/ROADMAP.md](docs/ROADMAP.md) for what's done and what's next. Not built yet: the fault-injection proxy, the control plane and dashboard, Playwright import, the k6 benchmark.
+This is the Week 1–5 slice of the plan: a single agent, several agents coordinated from one command or by hand, or agents working under Postgres leases with takeover of a dead agent's shard, with faults injected by a proxy in front of the target. See [docs/ROADMAP.md](docs/ROADMAP.md) for what's done and what's next. Not built yet: tenancy and quotas, OpenTelemetry, the control plane and dashboard, Playwright import, the k6 benchmark.
 
 The Docker files (`docker-compose.yml`, `agent/Dockerfile`) are written but have not been built or run.

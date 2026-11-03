@@ -45,9 +45,12 @@ These are about people, not code. The code below is ahead of the user work.
 
 ## Week 5: fault injection
 
-- [ ] Fault proxy: latency, timeout, connection reset, 429, 5xx, packet loss
-- [ ] Network presets (high RTT, loss, intermittent)
-- [ ] Until then, `hooks.before` can toggle faults on a target that exposes a control endpoint, which is what the demo does
+- [x] Fault proxy: latency, timeout, connection reset, 429, 5xx, per path and rate, before or after the target handles the request (embedded, or `burstforge proxy` for remote agents)
+- [x] Network presets (high-rtt, lossy, intermittent, mobile-3g). Loss is approximated at the HTTP level; real packet loss needs tc/netem
+- [x] Same seed, same faulted requests, so before/after runs are comparable
+- [x] Milestone: `make faults` injects SSO latency and shows retry amplification (2.46 vs 1.00 SSO calls per workflow, 1.23x vs 1.05x)
+- [x] Found and fixed: Go's HTTP client silently resent some requests after connection errors, uncounted
+- [ ] `finalize` run separately from the coordinator has no fault counts (only the coordinator reads the proxy's stats)
 
 ## Week 6: tenancy and telemetry
 

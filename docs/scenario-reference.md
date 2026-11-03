@@ -99,3 +99,35 @@ Each is an upper limit. Omit the ones you don't care about.
 | `error_rate` | Failed workflows divided by started workflows. |
 | `retry_amplification` | HTTP attempts divided by intended requests. |
 | `arrival_skew_p99_ms` | p99 gap between planned and actual start. |
+
+## faults
+
+Faults are injected by a proxy between the agents and the target. Only workflow traffic goes through it; hooks, `observe` snapshots and invariant checks go to the target directly, so faults never distort the checks.
+
+```yaml
+faults:
+  preset: lossy                      # optional network profile
+  rules:
+    - { name: slow SSO, path: /auth/refresh, latency: 2s, jitter: 300ms, phase: after, rate: 0.3 }
+    - { path: /register, status: 429, retry_after: 1s, rate: 0.2 }
+    - { name: lost confirmation, path: /register, reset: true, phase: after, rate: 0.1 }
+```
+
+| Field | Meaning |
+|---|---|
+| `proxy` | URL of a running `burstforge proxy`. Leave it out and the coordinator starts one on 127.0.0.1, which only agents on the same machine can reach. Its host must pass the same safety check as the target. |
+| `preset` | `high-rtt`, `lossy`, `intermittent` or `mobile-3g`. Its rules run before yours. |
+| `rules[].path` / `method` | Path prefix and method to match. Both optional. |
+| `rules[].rate` | Fraction of matching requests to fault. Default 1. |
+| `rules[].phase` | `before` (default): the target never sees the request. `after`: the target handles it, then the response is delayed or dropped. `after` is the case that tests idempotency: the work was done, but the client doesn't know and retries. |
+| `latency` (+ `jitter`) | Add delay. Latency rules add up. |
+| `status` (+ `retry_after`) | Answer with this 4xx/5xx instead of the target. Only `before`. |
+| `reset` | Close the connection with a TCP reset. |
+| `timeout` | Don't answer; hold the request until the client gives up (at most 2 minutes). |
+| `every` + `for` | Only active for `for` out of every `every`, counted from the first arrival. |
+
+Each rule sets exactly one of `latency`, `status`, `reset`, `timeout`. Besides latency, at most one fault applies to a request: the first rule that fires.
+
+Whether a request is faulted depends on the seed, the arrival number, the attempt number, the method and the path. So two runs with the same `--seed` fault the same first attempts, which is what makes before/after comparisons fair. Retries can differ, because they depend on the client's retry policy.
+
+The proxy works at the HTTP level and can't drop packets. `lossy` and `mobile-3g` approximate what loss does to a request: a retransmission-sized delay (about 1s) for 2% of requests and a reset for 0.5%. For real packet loss, use tc/netem on a test host.
