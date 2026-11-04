@@ -259,10 +259,12 @@ func TestShardedRunMatchesSingleAgent(t *testing.T) {
 		id := r.Header.Get("X-BF-Logical-Id")
 		mu.Lock()
 		seen[id]++
-		n := seen[id]
 		mu.Unlock()
-		if n == 1 && strings.HasSuffix(id, "7") {
-			w.WriteHeader(503) // ids ending in 7 need one retry
+		// Ids ending in 7 need one retry. Keyed on the attempt header, not
+		// on arrival order: a double submit can reach the server before the
+		// first attempt, and must not take its 503.
+		if r.Header.Get("X-BF-Attempt") == "1" && strings.HasSuffix(id, "7") {
+			w.WriteHeader(503)
 			return
 		}
 		w.WriteHeader(200)

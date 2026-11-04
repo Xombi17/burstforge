@@ -42,8 +42,11 @@ type Options struct {
 	Agent   string // name recorded in shard reports
 
 	// TrafficURL, if set, receives the workflow requests instead of
-	// target.base_url: a fault proxy in front of the target.
-	TrafficURL string
+	// target.base_url: a fault proxy in front of the target. Its host must
+	// pass the same check as the target, or be in TrustedProxies (hosts the
+	// agent's operator allowed with --trust-proxy).
+	TrafficURL     string
+	TrustedProxies []string
 
 	// Lease-based execution (run --db). With a Lease, the shard starts at
 	// arrival Resume, sends only reserved arrivals, and skips arrivals that
@@ -53,6 +56,10 @@ type Options struct {
 	Heartbeat time.Duration // default 1s
 	LeaseTTL  time.Duration // default 5s
 	LateLimit time.Duration // default 1s
+
+	// Observer, if set, sees every attempt and workflow (live metrics,
+	// trace export).
+	Observer Observer
 }
 
 func (o *Options) sharded() bool { return o.ShardCount > 0 }
@@ -98,7 +105,8 @@ func checkSafety(sc *scenario.Scenario, opt Options) error {
 			sc.Traffic.Arrivals, opt.MaxArrivals)
 	}
 	if opt.TrafficURL != "" {
-		if err := scenario.CheckHost(opt.TrafficURL, sc.Target.AllowHosts); err != nil {
+		allow := append(append([]string{}, sc.Target.AllowHosts...), opt.TrustedProxies...)
+		if err := scenario.CheckHost(opt.TrafficURL, allow); err != nil {
 			return fmt.Errorf("traffic URL: %w", err)
 		}
 	}
@@ -444,6 +452,8 @@ func (e *engine) workflow(ctx context.Context, i int, planned time.Duration) {
 	e.col.recordSkew(begin.Sub(e.start.Add(planned)))
 
 	runID := e.opt.RunID
+	tc := traceCtx{trace: WorkflowTraceID(runID, i), root: newSpanID()}
+	ctx = withTrace(ctx, tc)
 	vars := map[string]string{
 		"n":          strconv.Itoa(i),
 		"logical_id": fmt.Sprintf("%s-%d", runID, i),
@@ -481,7 +491,13 @@ func (e *engine) workflow(ctx context.Context, i int, planned time.Duration) {
 	if ctx.Err() != nil {
 		return
 	}
-	e.col.finishWorkflow(ok, outcome, time.Since(begin))
+	took := time.Since(begin)
+	e.col.finishWorkflow(ok, outcome, took)
+	if e.opt.Observer != nil {
+		e.opt.Observer.Workflow(WorkflowEvent{
+			Arrival: i, OK: ok, Outcome: outcome, Start: begin, Duration: took, Trace: tc.trace, Span: tc.root,
+		})
+	}
 }
 
 type stepResult struct {
@@ -588,11 +604,18 @@ func (e *engine) attempt(ctx context.Context, st scenario.Step, r request, n int
 		hr.Header.Set(k, v)
 	}
 	hr.Header.Set("X-BF-Attempt", strconv.Itoa(n))
+	tc, traced := traceFrom(ctx)
+	span := newSpanID()
+	if traced && hr.Header.Get("Traceparent") == "" { // the scenario may set its own
+		hr.Header.Set("Traceparent", traceparent(tc.trace, span))
+	}
 
 	t0 := time.Now()
 	res := attemptResult{}
+	status := 0
 	resp, err := e.client.Do(hr)
 	if err == nil {
+		status = resp.StatusCode
 		var body []byte
 		body, err = io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
@@ -618,10 +641,21 @@ func (e *engine) attempt(ctx context.Context, st scenario.Step, r request, n int
 		}
 	}
 	lat := time.Since(t0)
-	for n := writes.Load(); n > 1; n-- {
+	arrival, _ := strconv.Atoi(r.headers["X-BF-Arrival"])
+	for k := writes.Load(); k > 1; k-- {
 		e.col.recordAttempt(st.Name, "transport_retry", "conn_error", -1, t0.Sub(e.start))
+		if e.opt.Observer != nil {
+			e.opt.Observer.Attempt(AttemptEvent{Arrival: arrival, Step: st.Name, Method: r.method, URL: r.url, N: n, Kind: "transport_retry",
+				Class: "conn_error", Start: t0, Duration: -1, Trace: tc.trace, Parent: tc.root})
+		}
 	}
 	e.col.recordAttempt(st.Name, kind, res.class, lat, t0.Sub(e.start))
+	if e.opt.Observer != nil {
+		e.opt.Observer.Attempt(AttemptEvent{
+			Arrival: arrival, Step: st.Name, Method: r.method, URL: r.url, N: n, Kind: kind, Class: res.class,
+			Status: status, Start: t0, Duration: lat, Trace: tc.trace, Span: span, Parent: tc.root,
+		})
+	}
 	return res
 }
 

@@ -26,7 +26,7 @@ A scenario is one YAML file. Unknown fields are errors. Durations use Go syntax 
 
 ## hooks
 
-`before` and `after` are lists of `{ method, path, headers, body }`. Method defaults to `POST`. A non-2xx response in `before` aborts the run. Use them to reset state or switch the target into a fault mode.
+`before` and `after` are lists of `{ method, path, headers, body }`. Method defaults to `POST`. The path must start with `/`. It is appended to `base_url`, and a path that doesn't start with `/` could change the host. A non-2xx response in `before` aborts the run. Use them to reset state or switch the target into a fault mode.
 
 ## workflow.steps[]
 
@@ -42,6 +42,8 @@ A scenario is one YAML file. Unknown fields are errors. Durations use Go syntax 
 | `retry` | one attempt | See below. |
 
 Built-in variables: `{{n}}` (arrival index), `{{logical_id}}` (stable per user, good for idempotency keys), `{{run_id}}`.
+
+Every attempt also carries `X-BF-Run`, `X-BF-Logical-Id`, `X-BF-Arrival`, `X-BF-Attempt` and a W3C `traceparent`, unless the step sets its own. The trace ID is the same for every attempt of one workflow. See [tenancy.md](tenancy.md#tracing).
 
 ### retry
 
@@ -76,7 +78,7 @@ observe:
   counters: [sso_calls, db_queries]
 ```
 
-The endpoint is read before and after. Each counter's delta and delta per workflow go in the report.
+`url` is a path on the target, starting with `/`. The endpoint is read before and after. Each counter's delta and delta per workflow go in the report.
 
 ## invariants[]
 
@@ -88,6 +90,8 @@ The endpoint is read before and after. Each counter's delta and delta per workfl
   value: 0
   eventually: 20s # optional: poll until true, up to this long
 ```
+
+`path` starts with `/`, like every other path.
 
 ## thresholds
 

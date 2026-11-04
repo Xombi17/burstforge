@@ -138,19 +138,39 @@ func Load(path string) (*Scenario, error) {
 	if err != nil {
 		return nil, err
 	}
+	sc, err := Parse(raw, strings.TrimSuffix(filepath.Base(path), filepath.Ext(path)))
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	return sc, nil
+}
+
+// Parse decodes, defaults and validates a scenario. name is used if the
+// scenario doesn't set one.
+func Parse(raw []byte, name string) (*Scenario, error) {
+	sc, err := Decode(raw, name)
+	if err != nil {
+		return nil, err
+	}
+	if err := sc.Validate(); err != nil {
+		return nil, err
+	}
+	return sc, nil
+}
+
+// Decode decodes and defaults a scenario without validating it, for callers
+// that change fields (the target, for example) before validating.
+func Decode(raw []byte, name string) (*Scenario, error) {
 	var sc Scenario
 	dec := yaml.NewDecoder(bytes.NewReader(raw))
 	dec.KnownFields(true)
 	if err := dec.Decode(&sc); err != nil {
-		return nil, fmt.Errorf("%s: %w", path, err)
+		return nil, err
 	}
 	if sc.Name == "" {
-		sc.Name = strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+		sc.Name = name
 	}
 	sc.applyDefaults()
-	if err := sc.Validate(); err != nil {
-		return nil, fmt.Errorf("%s: %w", path, err)
-	}
 	return &sc, nil
 }
 
@@ -217,6 +237,23 @@ func (s *Scenario) Validate() error {
 		add("target.base_url is required")
 	case err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "":
 		add("target.base_url must be an http(s) URL, got %q", s.Target.BaseURL)
+	case u.User != nil || u.RawQuery != "" || u.Fragment != "":
+		add("target.base_url must not contain credentials, a query or a fragment")
+	}
+	// Every other URL is base_url + path. A path that doesn't start with /
+	// could change the host ("@other-host/...").
+	for i, h := range s.Hooks.Before {
+		if !strings.HasPrefix(h.Path, "/") {
+			add("hooks.before[%d].path must start with /", i)
+		}
+	}
+	for i, h := range s.Hooks.After {
+		if !strings.HasPrefix(h.Path, "/") {
+			add("hooks.after[%d].path must start with /", i)
+		}
+	}
+	if s.Observe.URL != "" && !strings.HasPrefix(s.Observe.URL, "/") {
+		add("observe.url must be a path on the target starting with /")
 	}
 	if s.Target.Environment != "local" && s.Target.Environment != "staging" {
 		add("target.environment must be \"local\" or \"staging\" (production targets are not supported)")
@@ -302,6 +339,8 @@ func (s *Scenario) Validate() error {
 		at := fmt.Sprintf("invariants[%d]", i)
 		if inv.Name == "" || inv.Path == "" || inv.JSON == "" {
 			add("%s needs name, path and json", at)
+		} else if !strings.HasPrefix(inv.Path, "/") {
+			add("%s.path must start with /", at)
 		}
 		switch inv.Op {
 		case "eq", "lt", "lte", "gt", "gte":

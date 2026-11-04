@@ -1,0 +1,19 @@
+{
+  "name": "burstforge-control-plane",
+  "version": "0.1.0",
+  "private": true,
+  "description": "BurstForge control plane: organizations, API keys, quotas and run requests.",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "admin": "node src/admin.js",
+    "test": "node --test test/*.test.js"
+  },
+  "dependencies": {
+    "fastify": "5.12.8",
+    "pg": "8.23.1"
+  }
+}

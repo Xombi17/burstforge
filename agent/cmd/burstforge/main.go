@@ -7,10 +7,12 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -25,19 +27,22 @@ import (
 	"burstforge/internal/report"
 	"burstforge/internal/runner"
 	"burstforge/internal/scenario"
+	"burstforge/internal/store"
+	"burstforge/internal/telemetry"
+	"burstforge/internal/tenancy"
 )
 
 const usage = `burstforge %s
 
 Usage:
-  burstforge validate <scenario.yaml>
+  burstforge validate [--json] [--bind URL] <scenario.yaml | ->
   burstforge run <scenario.yaml> [--agents N] [--out DIR] [--seed N] [scenario flags]
   burstforge agent <scenario.yaml> --shard K/N --seed N --run-id ID --start-at TIME
                                    [--via URL] [--out DIR] [--name NAME] [scenario flags]
   burstforge merge <scenario.yaml> <shard.json>... [--out DIR] [--no-check]
                                    [--allow-partial] [scenario flags]
   burstforge compare <before/report.json> <after/report.json>
-  burstforge proxy --upstream URL [--listen ADDR] [--allow-host HOST]
+  burstforge proxy --upstream URL [--listen ADDR] [--allow-host HOSTS]
 
 With Postgres (leases, heartbeats, takeover of a dead agent's shard):
   burstforge run <scenario.yaml> --db URL --shards N [--agents M] [--lease-ttl D]
@@ -46,7 +51,13 @@ With Postgres (leases, heartbeats, takeover of a dead agent's shard):
   burstforge finalize --db URL <run-id> [--out DIR]
   burstforge status --db URL [run-id]
 
-Scenario flags: [--arrivals N] [--max-arrivals N] [--target URL] [--allow-host HOST]
+For the control plane (organizations, API keys, quotas; see docs/tenancy.md):
+  burstforge migrate --db URL
+  burstforge controller --db URL [--proxy-listen ADDR] [--proxy-advertise HOST]
+  burstforge agent --db URL --require-org [--trust-proxy HOSTS]
+
+Scenario flags: [--arrivals N] [--max-arrivals N] [--target URL]
+                [--allow-host HOST,...] [--fault-proxy URL]
 
 run --agents N splits the run across N local agent processes and merges their
 reports. agent and merge are the same two halves, for running agents on
@@ -79,6 +90,10 @@ func main() {
 		code = cmdStatus(os.Args[2:])
 	case "proxy":
 		code = cmdProxy(os.Args[2:])
+	case "controller":
+		code = cmdController(os.Args[2:])
+	case "migrate":
+		code = cmdMigrate(os.Args[2:])
 	case "version", "--version":
 		fmt.Println("burstforge", runner.Version)
 	case "help", "-h", "--help":
@@ -113,6 +128,7 @@ type scenarioFlags struct {
 	maxArrivals int
 	target      string
 	allowHost   string
+	faultProxy  string
 }
 
 func addScenarioFlags(fs *flag.FlagSet) *scenarioFlags {
@@ -120,7 +136,8 @@ func addScenarioFlags(fs *flag.FlagSet) *scenarioFlags {
 	fs.IntVar(&f.arrivals, "arrivals", 0, "override traffic.arrivals")
 	fs.IntVar(&f.maxArrivals, "max-arrivals", 10000, "safety cap on traffic.arrivals")
 	fs.StringVar(&f.target, "target", "", "override target.base_url")
-	fs.StringVar(&f.allowHost, "allow-host", "", "add a host to target.allow_hosts (for example a docker service name)")
+	fs.StringVar(&f.allowHost, "allow-host", "", "add hosts, comma-separated, to target.allow_hosts (for example docker service names)")
+	fs.StringVar(&f.faultProxy, "fault-proxy", "", "use this running `burstforge proxy` (overrides faults.proxy)")
 	return f
 }
 
@@ -135,8 +152,9 @@ func (f *scenarioFlags) load(path string) (*scenario.Scenario, error) {
 	if f.target != "" {
 		sc.Target.BaseURL = f.target
 	}
-	if f.allowHost != "" {
-		sc.Target.AllowHosts = append(sc.Target.AllowHosts, f.allowHost)
+	sc.Target.AllowHosts = append(sc.Target.AllowHosts, splitList(f.allowHost)...)
+	if f.faultProxy != "" {
+		sc.Faults.Proxy = f.faultProxy
 	}
 	if err := sc.Validate(); err != nil {
 		return nil, err
@@ -156,27 +174,170 @@ func (f *scenarioFlags) args() []string {
 	if f.allowHost != "" {
 		a = append(a, "--allow-host", f.allowHost)
 	}
+	if f.faultProxy != "" {
+		a = append(a, "--fault-proxy", f.faultProxy)
+	}
 	return a
+}
+
+// startOTLP starts the span exporter if OTEL_EXPORTER_OTLP_ENDPOINT (or
+// ..._TRACES_ENDPOINT) is set. The returned func flushes and reports.
+func startOTLP(agent string) (*telemetry.OTLP, func()) {
+	exp, err := telemetry.OTLPFromEnv(agent)
+	if err != nil {
+		logf("not exporting traces: %v", err)
+	}
+	if exp == nil {
+		return nil, func() {}
+	}
+	return exp, func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		exp.Close(ctx)
+		ex, dr := exp.Stats()
+		logf("traces: %d spans exported to the OTLP collector, %d dropped", ex, dr)
+	}
+}
+
+// observers combines the exporters that are on, or returns nil.
+func observers(spans *telemetry.OTLP, prom *telemetry.Prometheus, run, org string, shard int) runner.Observer {
+	var obs runner.Observers
+	if spans != nil {
+		obs = append(obs, spans.ForRun(run, org, shard))
+	}
+	if prom != nil {
+		obs = append(obs, prom.ForRun(run, org, shard))
+	}
+	if len(obs) == 0 {
+		return nil
+	}
+	return obs
+}
+
+// splitList splits a comma-separated flag value, dropping empty entries.
+func splitList(s string) []string {
+	var out []string
+	for _, v := range strings.Split(s, ",") {
+		if v = strings.TrimSpace(v); v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// writable fails early when reports can't be written to dir, so a run
+// doesn't send its traffic and then lose the report.
+func writable(dir string) error {
+	fail := func(err error) error {
+		return fmt.Errorf("can't write reports to %s: %w (pick another directory with --out)", dir, err)
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fail(err)
+	}
+	f, err := os.CreateTemp(dir, ".burstforge-write-check-*")
+	if err != nil {
+		return fail(err)
+	}
+	_ = f.Close()
+	return os.Remove(f.Name())
 }
 
 func cmdValidate(args []string) int {
 	fs := flag.NewFlagSet("validate", flag.ContinueOnError)
+	asJSON := fs.Bool("json", false, "print the result as JSON, including the traffic shape (for the control plane)")
+	bind := fs.String("bind", "", "point the scenario at this environment URL first, as the controller does")
+	seed := fs.Int64("seed", 1, "seed for the traffic shape (--json)")
 	pos, err := parse(fs, args)
 	if err != nil || len(pos) != 1 {
-		fmt.Fprintln(os.Stderr, "usage: burstforge validate <scenario.yaml>")
+		fmt.Fprintln(os.Stderr, "usage: burstforge validate [--json] [--bind URL] [--seed N] <scenario.yaml | ->")
 		return 2
 	}
-	sc, err := scenario.Load(pos[0])
+	sc, err := validateScenario(pos[0], *bind)
+	if *asJSON {
+		out := struct {
+			OK            bool     `json:"ok"`
+			Errors        []string `json:"errors,omitempty"`
+			Name          string   `json:"name,omitempty"`
+			Profile       string   `json:"profile,omitempty"`
+			Arrivals      int      `json:"arrivals,omitempty"`
+			PeakPerSec    int      `json:"peak_per_sec,omitempty"`
+			PlannedSpanMs int64    `json:"planned_span_ms,omitempty"`
+			Faults        bool     `json:"faults,omitempty"`
+		}{OK: err == nil}
+		if err == nil {
+			var shape tenancy.Shape
+			if shape, err = tenancy.Measure(sc, *seed); err == nil {
+				out.Name, out.Profile, out.Faults = sc.Name, sc.Traffic.Profile, sc.Faults.Enabled()
+				out.Arrivals, out.PeakPerSec, out.PlannedSpanMs = shape.Arrivals, shape.PeakPerSec, shape.PlannedSpan.Milliseconds()
+			}
+		}
+		if err != nil {
+			out.OK = false
+			for _, line := range strings.Split(err.Error(), "\n") {
+				if line = strings.TrimSpace(line); line != "" {
+					out.Errors = append(out.Errors, line)
+				}
+			}
+		}
+		_ = json.NewEncoder(os.Stdout).Encode(out)
+		if !out.OK {
+			return 2
+		}
+		return 0
+	}
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 2
-	}
-	if err := sc.CheckTarget(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 2
 	}
 	fmt.Printf("ok: %s (%d steps, %d %s arrivals, %d invariants)\n",
 		sc.Name, len(sc.Workflow.Steps), sc.Traffic.Arrivals, sc.Traffic.Profile, len(sc.Invariants))
+	return 0
+}
+
+// validateScenario loads a scenario from a file or stdin ("-"), optionally
+// binds it to an environment URL, and runs every check the CLI runs.
+func validateScenario(path, bind string) (*scenario.Scenario, error) {
+	var raw []byte
+	var err error
+	name := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+	if path == "-" {
+		raw, err = io.ReadAll(io.LimitReader(os.Stdin, 1<<20))
+		name = "scenario"
+	} else {
+		raw, err = os.ReadFile(path)
+	}
+	if err != nil {
+		return nil, err
+	}
+	sc, err := scenario.Decode(raw, name)
+	if err != nil {
+		return nil, err
+	}
+	if bind != "" {
+		if err := tenancy.Bind(sc, tenancy.Environment{BaseURL: bind}); err != nil {
+			return nil, err
+		}
+	}
+	if err := sc.Validate(); err != nil {
+		return nil, err
+	}
+	return sc, sc.CheckTarget()
+}
+
+func cmdMigrate(args []string) int {
+	fs := flag.NewFlagSet("migrate", flag.ContinueOnError)
+	url := dbURLFlag(fs)
+	if _, err := parse(fs, args); err != nil || *url == "" {
+		fmt.Fprintln(os.Stderr, "usage: burstforge migrate --db URL")
+		return 2
+	}
+	st, err := store.Open(context.Background(), *url)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "migrating:", err)
+		return 2
+	}
+	st.Close()
+	fmt.Println("schema is up to date")
 	return 0
 }
 
@@ -211,6 +372,10 @@ func cmdRun(args []string) int {
 		fmt.Fprintf(os.Stderr, "--shards must be between 1 and traffic.arrivals (%d)\n", sc.Traffic.Arrivals)
 		return 2
 	}
+	if err := writable(*out); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 2
+	}
 	if *seed == 0 {
 		*seed = time.Now().UnixNano() % 1_000_000
 	}
@@ -231,9 +396,12 @@ func cmdRun(args []string) int {
 	if df.url != "" {
 		rep, err = coordinateDB(ctx, pos[0], sc, sf, df, *agents, *seed, runID)
 	} else if *agents == 1 {
+		spans, closeSpans := startOTLP("local")
 		rep, err = runner.Run(ctx, sc, runner.Options{
 			Seed: *seed, RunID: runID, MaxArrivals: sf.maxArrivals, Logf: logf,
+			Observer: observers(spans, nil, runID, "", 0),
 		})
+		closeSpans()
 	} else {
 		rep, err = coordinate(ctx, pos[0], sc, sf, *agents, *seed, runID, *out)
 	}
@@ -432,13 +600,21 @@ func cmdAgent(args []string) int {
 		return 2
 	}
 
+	if err := writable(*out); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 2
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	spans, closeSpans := startOTLP(*name)
 	rep, err := runner.RunShard(ctx, sc, runner.Options{
 		Seed: *seed, RunID: *runID, MaxArrivals: sf.maxArrivals, Logf: logf,
 		Shard: k, ShardCount: n, StartAt: startAt, Agent: *name, TrafficURL: *via,
+		Observer: observers(spans, nil, *runID, "", k),
 	})
+	closeSpans()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		return 2
@@ -519,19 +695,19 @@ func cmdMerge(args []string) int {
 // finish writes report.json and report.md, prints the summary and returns
 // the exit code for the verdict.
 func finish(rep *report.Report, dir string) int {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 2
+	err := os.MkdirAll(dir, 0o755)
+	if err == nil {
+		err = rep.Save(filepath.Join(dir, "report.json"))
 	}
-	if err := rep.Save(filepath.Join(dir, "report.json")); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 2
-	}
-	if err := os.WriteFile(filepath.Join(dir, "report.md"), []byte(rep.Markdown()), 0o644); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 2
+	if err == nil {
+		err = os.WriteFile(filepath.Join(dir, "report.md"), []byte(rep.Markdown()), 0o644)
 	}
 	fmt.Print(rep.Text())
+	if err != nil {
+		// The traffic has been sent; at least show the summary.
+		fmt.Fprintln(os.Stderr, "writing the report:", err)
+		return 2
+	}
 	fmt.Printf("reports written to %s\n", dir)
 	if !rep.Verdict.Pass {
 		return 1
@@ -595,16 +771,13 @@ func cmdProxy(args []string) int {
 	fs := flag.NewFlagSet("proxy", flag.ContinueOnError)
 	upstream := fs.String("upstream", "", "the staging target to forward to (required)")
 	listen := fs.String("listen", "127.0.0.1:8081", "address to listen on")
-	allowHost := fs.String("allow-host", "", "allow an upstream host that is not loopback or private")
+	allowHost := fs.String("allow-host", "", "allow upstream hosts (comma-separated) that are not loopback or private")
 	pos, err := parse(fs, args)
 	if err != nil || len(pos) != 0 || *upstream == "" {
-		fmt.Fprintln(os.Stderr, "usage: burstforge proxy --upstream URL [--listen ADDR] [--allow-host HOST]")
+		fmt.Fprintln(os.Stderr, "usage: burstforge proxy --upstream URL [--listen ADDR] [--allow-host HOSTS]")
 		return 2
 	}
-	var allow []string
-	if *allowHost != "" {
-		allow = []string{*allowHost}
-	}
+	allow := splitList(*allowHost)
 	if err := scenario.CheckHost(*upstream, allow); err != nil {
 		fmt.Fprintf(os.Stderr, "--upstream: %v (for the proxy, allow a host with --allow-host)\n", err)
 		return 2
@@ -620,7 +793,13 @@ func cmdProxy(args []string) int {
 		return 2
 	}
 	fmt.Printf("fault proxy on %s -> %s (no faults until a run configures them)\n", e.URL, *upstream)
-	fmt.Printf("set faults.proxy: %s in the scenario, or use it with --via\n", e.URL)
+	use := e.URL
+	if host, port, err := net.SplitHostPort(strings.TrimPrefix(e.URL, "http://")); err == nil {
+		if ip := net.ParseIP(host); ip != nil && ip.IsUnspecified() {
+			use = "http://<this host>:" + port
+		}
+	}
+	fmt.Printf("point agents at it with --fault-proxy %s (or faults.proxy in the scenario)\n", use)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	<-ctx.Done()

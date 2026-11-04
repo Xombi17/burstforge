@@ -74,6 +74,27 @@ traffic: { profile: burst, arrivals: 0, double_submit: 2 }
 	}
 }
 
+func TestPathsCannotChangeTheHost(t *testing.T) {
+	bad := valid + `
+hooks:
+  before: [{ path: "@169.254.169.254/latest" }]
+  after: [{ path: "x" }]
+observe: { url: "http://elsewhere/stats", counters: [a] }
+invariants:
+  - { name: i, path: "@evil/x", json: $.a }
+`
+	_, err := Load(write(t, bad))
+	for _, want := range []string{"hooks.before[0].path", "hooks.after[0].path", "observe.url", "invariants[0].path"} {
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("missing %q in: %v", want, err)
+		}
+	}
+	creds := strings.Replace(valid, "http://localhost:9999", "http://u:p@localhost:9999", 1)
+	if _, err := Load(write(t, creds)); err == nil || !strings.Contains(err.Error(), "credentials") {
+		t.Errorf("credentials in base_url: %v", err)
+	}
+}
+
 func TestUnknownFieldsRejected(t *testing.T) {
 	if _, err := Load(write(t, valid+"\nrate_limit: 5\n")); err == nil {
 		t.Fatal("typos in field names must not be silently ignored")

@@ -337,7 +337,7 @@ func TestKilledAgentShardIsRecovered(t *testing.T) {
 	if b == nil || b.Resume == 0 {
 		t.Fatalf("takeover claim %+v", b)
 	}
-	if _, err := RunClaim(ctx, b, "b", 0, 0, t.Logf); err != nil {
+	if _, err := RunClaim(ctx, b, "b", 0, 0, t.Logf, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 

@@ -11,7 +11,9 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
 	_ "embed"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -52,12 +54,35 @@ func (s *Store) Close() { s.pool.Close() }
 
 func (s *Store) migrate(ctx context.Context) error {
 	// Several agents may start at once; CREATE IF NOT EXISTS is not safe
-	// under concurrency, so serialize on an advisory lock.
+	// under concurrency, so serialize on an advisory lock. The schema is
+	// applied only when its version changed: statements like ALTER TABLE ...
+	// ADD COLUMN IF NOT EXISTS lock the table even when they do nothing, and
+	// every agent that starts would otherwise stall running agents' writes
+	// (and could deadlock with them).
+	sum := sha256.Sum256([]byte(schema))
+	version := hex.EncodeToString(sum[:8])
 	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext('burstforge-schema'))`); err != nil {
 			return err
 		}
-		_, err := tx.Exec(ctx, schema)
+		if _, err := tx.Exec(ctx, `CREATE TABLE IF NOT EXISTS burstforge_schema (
+			id int PRIMARY KEY CHECK (id = 1), version text NOT NULL, applied_at timestamptz NOT NULL DEFAULT now())`); err != nil {
+			return err
+		}
+		var current string
+		err := tx.QueryRow(ctx, `SELECT version FROM burstforge_schema WHERE id = 1`).Scan(&current)
+		if err == nil && current == version {
+			return nil
+		}
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		}
+		if _, err := tx.Exec(ctx, schema); err != nil {
+			return err
+		}
+		_, err = tx.Exec(ctx, `
+			INSERT INTO burstforge_schema (id, version) VALUES (1, $1)
+			ON CONFLICT (id) DO UPDATE SET version = $1, applied_at = now()`, version)
 		return err
 	})
 }
@@ -73,6 +98,12 @@ type NewRun struct {
 	LeaseTTL   time.Duration
 	Before     map[string]float64
 	TrafficURL string // fault proxy agents send workflow traffic to; empty for none
+
+	// Set for runs requested through the control plane. Controller is the
+	// controller holding the request; storing the run marks it started.
+	Organization string
+	Environment  string
+	Controller   string
 }
 
 // ShardSize is how many arrivals round-robin sharding gives shard k (1-based).
@@ -99,14 +130,27 @@ func (s *Store) CreateRun(ctx context.Context, nr NewRun) (time.Time, error) {
 	var startAt time.Time
 	err = pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		err := tx.QueryRow(ctx, `
-			INSERT INTO runs (id, scenario_name, scenario, scenario_hash, seed, shard_count, start_at, lease_ttl_ms, before_counters, traffic_url)
-			VALUES ($1, $2, $3, $4, $5, $6, now() + make_interval(secs => $7), $8, $9, nullif($10, ''))
+			INSERT INTO runs (id, scenario_name, scenario, scenario_hash, seed, shard_count, start_at, lease_ttl_ms,
+			                  before_counters, traffic_url, organization_id, environment)
+			VALUES ($1, $2, $3, $4, $5, $6, now() + make_interval(secs => $7), $8, $9, nullif($10, ''), nullif($11, ''), nullif($12, ''))
 			RETURNING start_at`,
 			nr.ID, sc.Name, scJSON, sc.Hash(), nr.Seed, nr.ShardCount,
-			nr.Lead.Seconds(), nr.LeaseTTL.Milliseconds(), before, nr.TrafficURL,
+			nr.Lead.Seconds(), nr.LeaseTTL.Milliseconds(), before, nr.TrafficURL, nr.Organization, nr.Environment,
 		).Scan(&startAt)
 		if err != nil {
 			return err
+		}
+		if nr.Organization != "" {
+			tag, err := tx.Exec(ctx, `
+				UPDATE run_requests SET status = 'started', updated_at = now()
+				WHERE id = $1 AND organization_id = $2 AND controller = $3 AND status = 'starting' AND lease_until > now()`,
+				nr.ID, nr.Organization, nr.Controller)
+			if err != nil {
+				return err
+			}
+			if tag.RowsAffected() != 1 {
+				return fmt.Errorf("run request %s is no longer held by controller %s", nr.ID, nr.Controller)
+			}
 		}
 		for k := 1; k <= nr.ShardCount; k++ {
 			if _, err := tx.Exec(ctx, `INSERT INTO run_shards (run_id, shard_no, arrivals) VALUES ($1, $2, $3)`,
@@ -131,15 +175,19 @@ type Run struct {
 	Before       map[string]float64
 	CreatedAt    time.Time
 	TrafficURL   string
+	Organization string // empty for runs created from the CLI
+	Environment  string
 }
 
-const runCols = `id, scenario, scenario_hash, seed, shard_count, start_at, lease_ttl_ms, status, before_counters, created_at, coalesce(traffic_url, '')`
+const runCols = `id, scenario, scenario_hash, seed, shard_count, start_at, lease_ttl_ms, status, before_counters, created_at,
+	coalesce(traffic_url, ''), coalesce(organization_id, ''), coalesce(environment, '')`
 
 func scanRun(row pgx.Row) (*Run, error) {
 	var r Run
 	var scJSON, before []byte
 	var ttlMs int64
-	if err := row.Scan(&r.ID, &scJSON, &r.ScenarioHash, &r.Seed, &r.ShardCount, &r.StartAt, &ttlMs, &r.Status, &before, &r.CreatedAt, &r.TrafficURL); err != nil {
+	if err := row.Scan(&r.ID, &scJSON, &r.ScenarioHash, &r.Seed, &r.ShardCount, &r.StartAt, &ttlMs, &r.Status, &before, &r.CreatedAt,
+		&r.TrafficURL, &r.Organization, &r.Environment); err != nil {
 		return nil, err
 	}
 	r.LeaseTTL = time.Duration(ttlMs) * time.Millisecond
@@ -255,6 +303,16 @@ type Claim struct {
 // a new epoch. It returns nil if there is nothing to claim. With runID set it
 // only looks at that run.
 func (s *Store) Claim(ctx context.Context, agentID, runID string, clockOffset, clockUncertainty time.Duration) (*Claim, error) {
+	return s.ClaimExcept(ctx, agentID, runID, nil, clockOffset, clockUncertainty)
+}
+
+// ClaimExcept is Claim, skipping the runs in exclude: the ones this agent
+// has refused. Without that, a refused run at the head of the queue would
+// keep every agent from reaching the runs behind it.
+func (s *Store) ClaimExcept(ctx context.Context, agentID, runID string, exclude []string, clockOffset, clockUncertainty time.Duration) (*Claim, error) {
+	if exclude == nil {
+		exclude = []string{}
+	}
 	var c *Claim
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		var rid string
@@ -269,10 +327,11 @@ func (s *Store) Claim(ctx context.Context, agentID, runID string, clockOffset, c
 			       ON l.run_id = sh.run_id AND l.shard_no = sh.shard_no AND l.epoch = sh.epoch
 			WHERE r.status = 'running'
 			  AND ($1 = '' OR r.id = $1)
+			  AND NOT (r.id = ANY($2))
 			  AND (sh.state = 'pending' OR (sh.state = 'claimed' AND l.expires_at <= now()))
 			ORDER BY r.created_at, sh.shard_no
 			LIMIT 1
-			FOR UPDATE OF sh SKIP LOCKED`, runID).Scan(&rid, &shard, &epoch, &resume)
+			FOR UPDATE OF sh SKIP LOCKED`, runID, exclude).Scan(&rid, &shard, &epoch, &resume)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil
 		}
@@ -703,10 +762,18 @@ func reduce(ctx context.Context, tx pgx.Tx, run *Run) (*report.Report, error) {
 
 // ---------------------------------------------------------------- work ---
 
+func trusted(run *Run, hosts []string) []string {
+	if run.Organization == "" {
+		return nil
+	}
+	return hosts
+}
+
 // RunClaim executes a claimed shard. clockOffset (database minus local)
 // converts the run's start time to the local clock. It returns
 // runner.ErrFenced if another agent took the shard over.
-func RunClaim(ctx context.Context, c *Claim, agent string, clockOffset time.Duration, maxArrivals int, logf func(string, ...any)) (*report.Report, error) {
+func RunClaim(ctx context.Context, c *Claim, agent string, clockOffset time.Duration, maxArrivals int,
+	logf func(string, ...any), obs runner.Observer, trustedProxies []string) (*report.Report, error) {
 	run := c.Run
 	hb := run.LeaseTTL / 5
 	if hb < 50*time.Millisecond {
@@ -723,8 +790,12 @@ func RunClaim(ctx context.Context, c *Claim, agent string, clockOffset time.Dura
 		Agent:       agent,
 		TrafficURL:  run.TrafficURL,
 		Lease:       c.Lease,
-		Resume:      c.Resume,
-		Heartbeat:   hb,
-		LeaseTTL:    run.LeaseTTL,
+		// Only organization runs have had their traffic URL checked
+		// against the agent's trusted proxies (CheckTenantRun).
+		TrustedProxies: trusted(run, trustedProxies),
+		Resume:         c.Resume,
+		Heartbeat:      hb,
+		LeaseTTL:       run.LeaseTTL,
+		Observer:       obs,
 	})
 }

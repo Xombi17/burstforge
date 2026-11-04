@@ -8,6 +8,9 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -21,6 +24,7 @@ import (
 	"burstforge/internal/runner"
 	"burstforge/internal/scenario"
 	"burstforge/internal/store"
+	"burstforge/internal/telemetry"
 )
 
 type dbFlags struct {
@@ -135,13 +139,13 @@ func coordinateDB(ctx context.Context, path string, sc *scenario.Scenario, sf *s
 	}
 
 	deadline := startAt.Add(time.Duration(base.Traffic.PlannedSpan*float64(time.Millisecond)) + df.drainTimeout)
-	aborted := waitForShards(ctx, st, runID, deadline, &mu)
+	aborted := waitForShards(ctx, st, runID, deadline, &mu, logf)
 
 	var faults *report.FaultReport
 	if fs != nil {
 		faults = fs.Collect(logf)
 	}
-	rep, err := finalizeRun(st, runID, aborted, faults)
+	rep, err := finalizeRun(st, runID, aborted, faults, logf)
 
 	// Workers notice the run is closed within a poll interval; nudge any
 	// that don't.
@@ -161,7 +165,7 @@ func coordinateDB(ctx context.Context, path string, sc *scenario.Scenario, sf *s
 // waitForShards polls shard state, printing changes, until every shard is
 // completed or abandoned, the deadline passes, or ctx ends. It reports
 // whether the run was interrupted.
-func waitForShards(ctx context.Context, st *store.Store, runID string, deadline time.Time, mu *sync.Mutex) bool {
+func waitForShards(ctx context.Context, st *store.Store, runID string, deadline time.Time, mu *sync.Mutex, logf func(string, ...any)) bool {
 	type seen struct {
 		state string
 		epoch int64
@@ -214,7 +218,7 @@ func waitForShards(ctx context.Context, st *store.Store, runID string, deadline 
 
 // finalizeRun closes the run: fence open shards, check the target, reduce
 // the telemetry and store the report. Safe to repeat after a crash.
-func finalizeRun(st *store.Store, runID string, aborted bool, faults *report.FaultReport) (*report.Report, error) {
+func finalizeRun(st *store.Store, runID string, aborted bool, faults *report.FaultReport, logf func(string, ...any)) (*report.Report, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 	run, err := st.BeginFinalize(ctx, runID)
@@ -244,9 +248,12 @@ func cmdAgentDB(args []string) int {
 	maxArrivals := fs.Int("max-arrivals", 10000, "refuse runs with more arrivals than this")
 	maxUncertainty := fs.Duration("max-clock-uncertainty", 100*time.Millisecond,
 		"refuse to claim if the clock offset to the database can't be measured more precisely than this")
+	requireOrg := fs.Bool("require-org", false, "only run shards of runs that belong to an organization (a shared agent pool)")
+	trustProxy := fs.String("trust-proxy", "", "hosts (comma-separated) of controllers whose fault proxies this agent may send through")
+	metricsAddr := fs.String("metrics-addr", "", "serve live Prometheus metrics at http://ADDR/metrics")
 	pos, err := parse(fs, args)
 	if err != nil || len(pos) != 0 || *url == "" {
-		fmt.Fprintln(os.Stderr, "usage: burstforge agent --db URL [--run ID] [--name NAME]")
+		fmt.Fprintln(os.Stderr, "usage: burstforge agent --db URL [--run ID] [--name NAME] [--require-org] [--trust-proxy HOSTS]")
 		return 2
 	}
 	if *name == "" {
@@ -262,6 +269,29 @@ func cmdAgentDB(args []string) int {
 		return 2
 	}
 	defer st.Close()
+	spans, closeSpans := startOTLP(*name)
+	defer closeSpans()
+	var prom *telemetry.Prometheus
+	if *metricsAddr != "" {
+		prom = telemetry.NewPrometheus()
+		if spans != nil {
+			prom.Also(func(w io.Writer) {
+				ex, dr := spans.Stats()
+				fmt.Fprintf(w, "# HELP burstforge_agent_spans_total Spans exported to or dropped before the OTLP collector.\n"+
+					"# TYPE burstforge_agent_spans_total counter\nburstforge_agent_spans_total{result=\"exported\"} %d\n"+
+					"burstforge_agent_spans_total{result=\"dropped\"} %d\n", ex, dr)
+			})
+		}
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", prom)
+		ln, err := net.Listen("tcp", *metricsAddr)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "--metrics-addr:", err)
+			return 2
+		}
+		go func() { _ = http.Serve(ln, mux) }()
+		logf("metrics on http://%s/metrics", ln.Addr())
+	}
 
 	sleep := func(d time.Duration) {
 		select {
@@ -282,7 +312,11 @@ func cmdAgentDB(args []string) int {
 			sleep(time.Second)
 			continue
 		}
-		c, err := st.Claim(ctx, *name, *runFilter, offset, uncertainty)
+		var skip []string
+		for id := range refused {
+			skip = append(skip, id)
+		}
+		c, err := st.ClaimExcept(ctx, *name, *runFilter, skip, offset, uncertainty)
 		if err != nil {
 			if ctx.Err() == nil {
 				logf("claiming a shard: %v", err)
@@ -300,15 +334,27 @@ func cmdAgentDB(args []string) int {
 			sleep(*poll)
 			continue
 		}
-		if refused[c.Run.ID] {
-			_ = c.Lease.Release(ctx, c.Resume, nil)
-			sleep(2 * time.Second)
+		// Runs that belong to an organization are checked against the
+		// organization's own limits and environment, and the target must
+		// still serve the approval token. The run row alone is not trusted.
+		var why error
+		switch {
+		case c.Run.Organization != "":
+			why = st.CheckTenantRun(ctx, c.Run, splitList(*trustProxy))
+		case *requireOrg:
+			why = errors.New("the run belongs to no organization and this agent has --require-org")
+		}
+		if why != nil {
+			logf("refusing run %s: %v", c.Run.ID, why)
+			refused[c.Run.ID] = true
+			_ = c.Lease.Release(context.Background(), c.Resume, nil)
 			continue
 		}
 		logf("claimed shard %d/%d of run %s (lease %d, from arrival %d, clock offset %s ±%s)",
 			c.Shard, c.Run.ShardCount, c.Run.ID, c.Epoch, c.Resume+1,
 			offset.Round(10*time.Microsecond), uncertainty.Round(10*time.Microsecond))
-		rep, err := store.RunClaim(ctx, c, *name, offset, *maxArrivals, logf)
+		rep, err := store.RunClaim(ctx, c, *name, offset, *maxArrivals, logf,
+			observers(spans, prom, c.Run.ID, c.Run.Organization, c.Shard), splitList(*trustProxy))
 		switch {
 		case errors.Is(err, runner.ErrFenced):
 			logf("shard %d: lost the lease; another agent owns it now", c.Shard)
@@ -343,6 +389,10 @@ func cmdFinalize(args []string) int {
 		fmt.Fprintln(os.Stderr, "usage: burstforge finalize --db URL <run-id> [--now]")
 		return 2
 	}
+	if err := writable(*out); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 2
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	st, err := store.Open(ctx, *url)
@@ -368,12 +418,12 @@ func cmdFinalize(args []string) int {
 		deadline := run.StartAt.Add(time.Duration(base.Traffic.PlannedSpan*float64(time.Millisecond)) + *drain)
 		logf("waiting for open shards (until %s; --now to skip)", deadline.Local().Format("15:04:05"))
 		// Ctrl-C here means "stop waiting", not "the run was aborted".
-		_ = waitForShards(ctx, st, run.ID, deadline, &sync.Mutex{})
+		_ = waitForShards(ctx, st, run.ID, deadline, &sync.Mutex{}, logf)
 	}
 	if run.Scenario.Faults.Enabled() {
 		logf("fault counts are only recorded by the coordinator that ran the proxy; this report won't have them")
 	}
-	rep, err := finalizeRun(st, run.ID, false, nil)
+	rep, err := finalizeRun(st, run.ID, false, nil, logf)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		return 2

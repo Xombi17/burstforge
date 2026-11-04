@@ -1,0 +1,6 @@
+.git
+bin
+results
+burstforge-results
+control-plane/node_modules
+**/*.log

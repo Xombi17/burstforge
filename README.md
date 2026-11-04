@@ -27,7 +27,7 @@ Typical numbers from the fragile run (they move a little between runs because th
 | | fragile | hardened |
 |---|---:|---:|
 | HTTP error rate | 0% | 0% |
-| Duplicate registrations | 5–12 | 0 |
+| Duplicate registrations | 3–12 | 0 |
 | Oversold seats | 0–3 | 0 |
 | Confirmation jobs lost | ~50 | 0 |
 | Latency p99 | ~9–10 s | ~5.5 s |
@@ -35,6 +35,8 @@ Typical numbers from the fragile run (they move a little between runs because th
 | SSO calls per workflow | ~3.0–3.3 | 1.0 |
 
 The first row is the point. An endpoint-only test calls the fragile run healthy.
+
+With Docker instead of Go and Node on the host, `./scripts/docker-demo.sh` (or `make docker-demo`) builds the images and runs the before/after burst, a Postgres-backed run with a worker container killed partway through, and the faults scenario through a proxy container. The commands it uses are at the top of [docker-compose.yml](docker-compose.yml). On Linux, run the agent container as yourself (`-u "$(id -u):$(id -g)"`) so it can write to `./results`.
 
 The hardened run's 1.13x is the floor for this scenario, not waste: 25% of users double-tap the final step, and those extra requests count. Its retry count is zero.
 
@@ -151,6 +153,14 @@ A run where any arrival didn't go as planned fails its verdict, and the report s
 
 `make recovery` runs the drill: 600 registrations over 30 seconds on three shards and four agents, with the agent holding shard 2 killed by SIGKILL partway through. In two runs here the lease expired within the 3s TTL of the kill, a spare resumed the shard 0.2–0.3s later, and 9 arrivals were unaccounted and 7 skipped. The verdict fails for that reason, so `make recovery` exits 1.
 
+### Several teams on one installation
+
+The control plane ([docs/tenancy.md](docs/tenancy.md)) puts organizations, API keys and quotas in front of the same engine. A team registers its staging target, proves it controls it by serving an approval token at `/.well-known/burstforge-approval.txt`, and submits scenarios over HTTP. A `burstforge controller` starts the runs, and agents started with `--require-org` check every run against its organization's limits and the target's token themselves before sending anything. `make tenants` runs three organizations at once with different quotas.
+
+### Traces and metrics
+
+Every request carries a W3C `traceparent` header. The trace is the workflow, and its ID is derived from the run ID and the arrival, so if the target is traced too, its spans for a failed registration sit under that workflow's attempts. Set `OTEL_EXPORTER_OTLP_ENDPOINT` and agents export the spans over OTLP/HTTP with JSON encoding to an OpenTelemetry collector (checked against Jaeger 1.62; other backends not tried). Export never slows the load: when the buffer is full, spans are dropped and counted. `agent --db --metrics-addr :9465` serves live Prometheus metrics per run, step and outcome, and the control plane has per-organization metrics (see [docs/tenancy.md](docs/tenancy.md#metrics)).
+
 Business invariants need a read-only endpoint on your staging app that exposes the counts you care about (see `GET /_bf/invariants` in [target/server.js](target/server.js) for a 20-line example). Without one, BurstForge still reports latency, failures and amplification.
 
 ## What it measures
@@ -170,27 +180,29 @@ BurstForge sends real load. It refuses to run unless:
 - the host is loopback, a private address, or listed in `target.allow_hosts`,
 - `traffic.arrivals` is under `--max-arrivals` (default 10,000).
 
-Unknown YAML fields are rejected, so a typo can't silently disable a limit.
+Hook, invariant and observe paths must start with `/`, so a scenario can't point them at another host. Unknown YAML fields are rejected, so a typo can't silently disable a limit. Runs submitted through the control plane are also bound to the organization's verified environment and checked against its quotas; see [docs/tenancy.md](docs/tenancy.md#safety).
 
 ## Layout
 
 ```
-agent/        Go: scenario parser, schedule planner, runner, histograms, reports, Postgres store, CLI
-target/       Node, zero dependencies: the fragile registration app (fragile and hardened profiles)
-scenarios/    smoke, burst and burst-fixed for the demo; faults and faults-fixed for the fault drill;
-              sustained for the recovery drill
-docs/         decision doc, roadmap, scenario reference
-scripts/      demo.sh
+agent/          Go: scenario parser, schedule planner, runner, histograms, reports, Postgres store,
+                fault proxy, tenancy checks, telemetry export, CLI (including the controller)
+control-plane/  Node + Fastify: organizations, API keys, quotas, run requests, per-org metrics
+target/         Node, zero dependencies: the fragile registration app (fragile and hardened profiles)
+scenarios/      smoke, burst and burst-fixed for the demo; faults and faults-fixed for the fault drill;
+                sustained for the recovery drill
+docs/           decision doc, roadmap, scenario reference, tenancy and the control plane
+scripts/        demo.sh, faults-demo.sh, recovery-demo.sh, tenants-demo.sh, docker-demo.sh
 ```
 
 ```bash
 make test     # go vet + unit tests
 make race     # same, under the race detector
-BURSTFORGE_TEST_DB=postgres://... make test-db   # lease and recovery tests against a real Postgres
+BURSTFORGE_TEST_DB=postgres://... make test-db   # store, recovery and control-plane tests against a real Postgres
 ```
 
 ## Status
 
-This is the Week 1–5 slice of the plan: a single agent, several agents coordinated from one command or by hand, or agents working under Postgres leases with takeover of a dead agent's shard, with faults injected by a proxy in front of the target. See [docs/ROADMAP.md](docs/ROADMAP.md) for what's done and what's next. Not built yet: tenancy and quotas, OpenTelemetry, the control plane and dashboard, Playwright import, the k6 benchmark.
+This is the Week 1–6 slice of the plan: a single agent, several agents coordinated from one command or by hand, or agents working under Postgres leases with takeover of a dead agent's shard, with faults injected by a proxy in front of the target, and a control plane with organizations, API keys and quotas. See [docs/ROADMAP.md](docs/ROADMAP.md) for what's done and what's next. Not built yet: the dashboard, Playwright import, the k6 benchmark, a Redis-backed rate limiter for more than one control-plane instance.
 
-The Docker files (`docker-compose.yml`, `agent/Dockerfile`) are written but have not been built or run.
+The Docker setup has been built and run on one Linux host (Docker 29, Compose 5.6): `scripts/docker-demo.sh` end to end, and the `platform` profile with one organization running the faults scenario. Not tried on Docker Desktop for Mac or Windows.

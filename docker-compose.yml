@@ -1,16 +1,50 @@
-# One-command local setup.
+# Local setup with Docker Compose. scripts/docker-demo.sh runs all of this.
 #
+# Reports land in ./results. Create it first and run the agent as yourself;
+# on Linux the image's non-root user can't write a directory owned by root.
+#
+#   mkdir -p results
 #   docker compose up -d target
-#   docker compose run --rm agent run /scenarios/registration-burst.yaml \
+#   docker compose run --rm -u "$(id -u):$(id -g)" agent \
+#       run /scenarios/registration-burst.yaml \
 #       --target http://target:8080 --allow-host target --out /results
 #
-# Reports land in ./results.
+# Postgres-backed run with agents in separate containers. The coordinator
+# starts no local agents (--agents 0); the worker containers claim the shards.
+#
+#   docker compose --profile db up -d postgres
+#   docker compose --profile db up -d --scale worker=3 worker
+#   docker compose run --rm -u "$(id -u):$(id -g)" agent \
+#       run /scenarios/registration-sustained.yaml \
+#       --target http://target:8080 --allow-host target --out /results \
+#       --db postgres://burstforge:burstforge@postgres:5432/burstforge --shards 3 --agents 0
+#
+# Faults through the standalone proxy service instead of an embedded one:
+#
+#   docker compose --profile faults up -d proxy
+#   docker compose run --rm -u "$(id -u):$(id -g)" agent \
+#       run /scenarios/registration-faults.yaml \
+#       --target http://target:8080 --allow-host target,proxy --out /results \
+#       --fault-proxy http://proxy:8081
+#
+# The control plane (Week 6): organizations, API keys and quotas, a
+# controller, and agents that only take organization runs. See
+# docs/tenancy.md for the API.
+#
+#   docker compose --profile platform up -d --scale tenant-agent=3
+#   docker compose exec control-plane node src/admin.js create-org acme --name Acme
+#
+# Everything here is for a local or staging network. Postgres uses a fixed
+# password and no port is published except the target's.
 services:
   target:
     build: ./target
+    image: burstforge-target
     ports: ["8080:8080"]
     environment:
       PROFILE: fragile
+      # Organizations allowed to test this target through the control plane.
+      APPROVAL_TOKENS: ${APPROVAL_TOKENS:-}
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:8080/healthz"]
       interval: 2s
@@ -19,9 +53,76 @@ services:
 
   agent:
     build: ./agent
+    image: burstforge-agent
     profiles: ["tools"]
     depends_on:
       target: { condition: service_healthy }
     volumes:
       - ./scenarios:/scenarios:ro
       - ./results:/results
+
+  postgres:
+    image: postgres:16-alpine
+    profiles: ["db", "platform"]
+    environment:
+      POSTGRES_USER: burstforge
+      POSTGRES_PASSWORD: burstforge
+      POSTGRES_DB: burstforge
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "burstforge", "-d", "burstforge"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  # Claims shards of any run in the database. Scale it with --scale worker=N.
+  worker:
+    build: ./agent
+    image: burstforge-agent
+    profiles: ["db"]
+    command: ["agent", "--db", "postgres://burstforge:burstforge@postgres:5432/burstforge"]
+    stop_signal: SIGINT
+    depends_on:
+      postgres: { condition: service_healthy }
+      target: { condition: service_healthy }
+
+  proxy:
+    build: ./agent
+    image: burstforge-agent
+    profiles: ["faults"]
+    command: ["proxy", "--upstream", "http://target:8080", "--listen", "0.0.0.0:8081", "--allow-host", "target"]
+    depends_on:
+      target: { condition: service_healthy }
+
+  control-plane:
+    build: { context: ., dockerfile: control-plane/Dockerfile }
+    image: burstforge-control-plane
+    profiles: ["platform"]
+    ports: ["8090:8090"]
+    environment:
+      BURSTFORGE_DB: postgres://burstforge:burstforge@postgres:5432/burstforge
+      BURSTFORGE_METRICS_TOKEN: ${BURSTFORGE_METRICS_TOKEN:-}
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  # Starts requested runs. Each run with faults gets its own proxy here, on
+  # a free port that agents reach as controller:<port>.
+  controller:
+    build: ./agent
+    image: burstforge-agent
+    profiles: ["platform"]
+    command: ["controller", "--db", "postgres://burstforge:burstforge@postgres:5432/burstforge",
+              "--proxy-listen", "0.0.0.0:0", "--proxy-advertise", "controller"]
+    depends_on:
+      control-plane: { condition: service_started }
+
+  # Agents for organization runs: they check each run against its
+  # organization and the target's approval token before sending anything.
+  tenant-agent:
+    build: ./agent
+    image: burstforge-agent
+    profiles: ["platform"]
+    command: ["agent", "--db", "postgres://burstforge:burstforge@postgres:5432/burstforge",
+              "--require-org", "--trust-proxy", "controller", "--metrics-addr", "0.0.0.0:9465"]
+    stop_signal: SIGINT
+    depends_on:
+      control-plane: { condition: service_started }

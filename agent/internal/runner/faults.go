@@ -60,6 +60,9 @@ func (fs *FaultSession) Apply(ctx context.Context, seed int64, startAt time.Time
 
 // Collect reads what was injected and clears the rules.
 func (fs *FaultSession) Collect(logf func(string, ...any)) *report.FaultReport {
+	if fs == nil {
+		return nil
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	st, err := fs.client.Stats(ctx)

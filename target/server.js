@@ -411,6 +411,12 @@ async function route(req, res) {
   const path = new URL(req.url, 'http://x').pathname;
 
   if (method === 'GET' && path === '/healthz') return send(res, 200, { ok: true });
+  // Organizations allowed to test this target through a BurstForge control
+  // plane, one approval token per line (APPROVAL_TOKENS, comma-separated).
+  if (method === 'GET' && path === '/.well-known/burstforge-approval.txt' && approvalTokens.length > 0) {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    return res.end(approvalTokens.join('\n') + '\n');
+  }
   if (method === 'GET' && path === '/_bf/config') return send(res, 200, cfg);
   if (method === 'GET' && path === '/_bf/stats') {
     return send(res, 200, {
@@ -444,6 +450,8 @@ async function route(req, res) {
   }
   throw new HttpError(404, 'not_found');
 }
+
+const approvalTokens = (process.env.APPROVAL_TOKENS || '').split(',').map((t) => t.trim()).filter(Boolean);
 
 const server = http.createServer((req, res) => {
   route(req, res).catch((err) => {
